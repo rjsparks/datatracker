@@ -1,14 +1,9 @@
 #!/bin/bash
 
 for sub in \
-    test/id \
-    test/staging \
-    test/archive \
-    test/rfc \
-    test/media \
-    test/wiki/ietf \
-    data/nomcom_keys/public_keys \
     /assets/archive/id \
+    /assets/collection \
+    /assets/collection/draft-archive \
     /assets/ietf-ftp \
     /assets/ietf-ftp/bofreq \
     /assets/ietf-ftp/charter \
@@ -25,6 +20,7 @@ for sub in \
     /assets/ietfdata/derived \
     /assets/ietfdata/derived/bibxml \
     /assets/ietfdata/derived/bibxml/bibxml-ids \
+    /assets/ietfdata/doc/draft/repository \
     /assets/www6s \
     /assets/www6s/staging \
     /assets/www6s/wg-descriptions \
@@ -33,6 +29,11 @@ for sub in \
     /assets/www6/iesg \
     /assets/www6/iesg/evaluation \
     /assets/media/photo \
+    /assets/tmp \
+    /assets/ftp \
+    /assets/ftp/charter \
+    /assets/ftp/internet-drafts \
+    /assets/ftp/review \
     ; do
     if [ ! -d "$sub"  ]; then
         echo "Creating dir $sub"

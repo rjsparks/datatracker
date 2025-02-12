@@ -1,10 +1,13 @@
-# Copyright The IETF Trust 2012-2023, All Rights Reserved
+# Copyright The IETF Trust 2012-2024, All Rights Reserved
 # -*- coding: utf-8 -*-
 
 
 import os
 import datetime
 import io
+from hashlib import sha384
+
+from django.http import HttpRequest
 import lxml
 import bibtexparser
 import mock
@@ -16,11 +19,9 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from pyquery import PyQuery
 from urllib.parse import urlparse, parse_qs
-from tempfile import NamedTemporaryFile
 from collections import defaultdict
 from zoneinfo import ZoneInfo
 
-from django.core.management import call_command
 from django.urls import reverse as urlreverse
 from django.conf import settings
 from django.forms import Form
@@ -37,7 +38,7 @@ import debug                            # pyflakes:ignore
 
 from ietf.doc.models import ( Document, DocRelationshipName, RelatedDocument, State,
     DocEvent, BallotPositionDocEvent, LastCallDocEvent, WriteupDocEvent, NewRevisionDocEvent, BallotType,
-    EditedAuthorsDocEvent )
+    EditedAuthorsDocEvent, StateType)
 from ietf.doc.factories import ( DocumentFactory, DocEventFactory, CharterFactory,
     ConflictReviewFactory, WgDraftFactory, IndividualDraftFactory, WgRfcFactory, 
     IndividualRfcFactory, StateDocEventFactory, BallotPositionDocEventFactory, 
@@ -45,7 +46,16 @@ from ietf.doc.factories import ( DocumentFactory, DocEventFactory, CharterFactor
     StatusChangeFactory, DocExtResourceFactory, RgDraftFactory, BcpFactory)
 from ietf.doc.forms import NotifyForm
 from ietf.doc.fields import SearchableDocumentsField
-from ietf.doc.utils import create_ballot_if_not_open, uppercase_std_abbreviated_name
+from ietf.doc.utils import (
+    create_ballot_if_not_open,
+    investigate_fragment,
+    uppercase_std_abbreviated_name,
+    DraftAliasGenerator,
+    generate_idnits2_rfc_status,
+    generate_idnits2_rfcs_obsoleted,
+    get_doc_email_aliases,
+)
+from ietf.doc.views_doc import get_diff_revisions
 from ietf.group.models import Group, Role
 from ietf.group.factories import GroupFactory, RoleFactory
 from ietf.ipr.factories import HolderIprDisclosureFactory
@@ -53,7 +63,7 @@ from ietf.meeting.models import Meeting, SessionPresentation, SchedulingEvent
 from ietf.meeting.factories import ( MeetingFactory, SessionFactory, SessionPresentationFactory,
      ProceedingsMaterialFactory )
 
-from ietf.name.models import SessionStatusName, BallotPositionName, DocTypeName
+from ietf.name.models import SessionStatusName, BallotPositionName, DocTypeName, RoleName
 from ietf.person.models import Person
 from ietf.person.factories import PersonFactory, EmailFactory
 from ietf.utils.mail import outbox, empty_outbox
@@ -1444,6 +1454,14 @@ Man                    Expires September 22, 2015               [Page 3]
         """Buttons for action holders should be shown when AD or secretary"""
         draft = WgDraftFactory()
         draft.action_holders.set([PersonFactory()])
+        other_group = GroupFactory(type_id=draft.group.type_id)
+
+        # create a test RoleName and put it in the docman_roles for the document group
+        RoleName.objects.create(slug="wrangler", name="Wrangler", used=True)
+        draft.group.features.docman_roles.append("wrangler")
+        draft.group.features.save()
+        wrangler = RoleFactory(group=draft.group, name_id="wrangler").person
+        wrangler_of_other_group = RoleFactory(group=other_group, name_id="wrangler").person
 
         url = urlreverse('ietf.doc.views_doc.document_main', kwargs=dict(name=draft.name))
         edit_ah_url = urlreverse('ietf.doc.views_doc.edit_action_holders', kwargs=dict(name=draft.name))
@@ -1476,6 +1494,8 @@ Man                    Expires September 22, 2015               [Page 3]
 
         _run_test(None, False)
         _run_test('plain', False)
+        _run_test(wrangler_of_other_group.user.username, False)
+        _run_test(wrangler.user.username, True)
         _run_test('ad', True)
         _run_test('secretary', True)
 
@@ -1512,6 +1532,25 @@ Man                    Expires September 22, 2015               [Page 3]
             r = self.client.get(urlreverse("ietf.doc.views_doc.document_main", kwargs=dict(name=rfc.name)))
             self.assertEqual(r.status_code, 200)
             self.assert_correct_non_wg_group_link(r, group)
+
+    def test_document_email_authors_button(self):
+        # rfc not from draft
+        rfc = WgRfcFactory()
+        DocEventFactory.create(doc=rfc, type='published_rfc')
+        url = urlreverse("ietf.doc.views_doc.document_main", kwargs=dict(name=rfc.name))
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        q = PyQuery(r.content)
+        self.assertEqual(len(q('a:contains("Email authors")')), 0, 'Did not expect "Email authors" button')
+
+        # rfc from draft
+        draft = WgDraftFactory(group=rfc.group)
+        draft.relateddocument_set.create(relationship_id="became_rfc", target=rfc)
+        draft.set_state(State.objects.get(used=True, type="draft", slug="rfc"))
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        q = PyQuery(r.content)
+        self.assertEqual(len(q('a:contains("Email authors")')), 1, 'Expected "Email authors" button')
 
     def test_document_primary_and_history_views(self):
         IndividualDraftFactory(name='draft-imaginary-independent-submission')
@@ -1658,6 +1697,17 @@ class DocTestCase(TestCase):
 
         r = self.client.get(urlreverse("ietf.doc.views_doc.document_main", kwargs=dict(name=doc.name)))
         self.assertEqual(r.status_code, 200)
+        self.assertNotContains(r, "The session for this document was cancelled.")
+
+        SchedulingEvent.objects.create(
+            session=session,
+            status_id='canceled',
+            by = Person.objects.get(user__username="marschairman"), 
+        )
+
+        r = self.client.get(urlreverse("ietf.doc.views_doc.document_main", kwargs=dict(name=doc.name)))
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "The session for this document was cancelled.")
 
     def test_document_ballot(self):
         doc = IndividualDraftFactory()
@@ -1840,6 +1890,18 @@ class DocTestCase(TestCase):
         self.assertContains(r, appr.text)
         self.assertContains(r, notes.text)
         self.assertContains(r, rfced_note.text)
+
+    def test_diff_revisions(self):
+        ind_doc = IndividualDraftFactory(create_revisions=range(2))
+        wg_doc = WgDraftFactory(
+            relations=[("replaces", ind_doc)], create_revisions=range(2)
+        )
+        diff_revisions = get_diff_revisions(HttpRequest(), wg_doc.name, wg_doc)
+        self.assertEqual(len(diff_revisions), 4)
+        self.assertEqual(
+            [t[3] for t in diff_revisions],
+            [f"{n}-{v:02d}" for n in [wg_doc.name, ind_doc.name] for v in [1, 0]],
+        )
 
     def test_history(self):
         doc = IndividualDraftFactory()
@@ -2144,25 +2206,9 @@ class ReferencesTest(TestCase):
         self.assertContains(r, doc1.name)
 
 class GenerateDraftAliasesTests(TestCase):
-    def setUp(self):
-        super().setUp()
-        self.doc_aliases_file = NamedTemporaryFile(delete=False, mode="w+")
-        self.doc_aliases_file.close()
-        self.doc_virtual_file = NamedTemporaryFile(delete=False, mode="w+")
-        self.doc_virtual_file.close()
-        self.saved_draft_aliases_path = settings.DRAFT_ALIASES_PATH
-        self.saved_draft_virtual_path = settings.DRAFT_VIRTUAL_PATH
-        settings.DRAFT_ALIASES_PATH = self.doc_aliases_file.name
-        settings.DRAFT_VIRTUAL_PATH = self.doc_virtual_file.name
-
-    def tearDown(self):
-        settings.DRAFT_ALIASES_PATH = self.saved_draft_aliases_path
-        settings.DRAFT_VIRTUAL_PATH = self.saved_draft_virtual_path
-        os.unlink(self.doc_aliases_file.name)
-        os.unlink(self.doc_virtual_file.name)
-        super().tearDown()
-
-    def testManagementCommand(self):
+    @override_settings(TOOLS_SERVER="tools.example.org", DRAFT_ALIAS_DOMAIN="draft.example.org")
+    def test_generator_class(self):
+        """The DraftAliasGenerator should generate the same lists as the old mgmt cmd"""
         a_month_ago = (timezone.now() - datetime.timedelta(30)).astimezone(RPC_TZINFO)
         a_month_ago = a_month_ago.replace(hour=0, minute=0, second=0, microsecond=0)
         ad = RoleFactory(
@@ -2180,12 +2226,12 @@ class GenerateDraftAliasesTests(TestCase):
         mars.role_set.create(
             name_id="chair", person=marschairman, email=marschairman.email()
         )
-        doc1 = IndividualDraftFactory(
-            authors=[author1], shepherd=shepherd.email(), ad=ad
-        )
+        doc1 = IndividualDraftFactory(authors=[author1], shepherd=shepherd.email(), ad=ad)
         doc2 = WgDraftFactory(
             name="draft-ietf-mars-test", group__acronym="mars", authors=[author2], ad=ad
         )
+        doc2.notify = f"{doc2.name}.ad@draft.example.org"
+        doc2.save()
         doc3 = WgDraftFactory.create(
             name="draft-ietf-mars-finished",
             group__acronym="mars",
@@ -2197,9 +2243,7 @@ class GenerateDraftAliasesTests(TestCase):
         )
         rfc3 = WgRfcFactory()
         DocEventFactory.create(doc=rfc3, type="published_rfc", time=a_month_ago)
-        doc3.relateddocument_set.create(
-            relationship_id="became_rfc", target=rfc3
-        )
+        doc3.relateddocument_set.create(relationship_id="became_rfc", target=rfc3)
         doc4 = WgDraftFactory.create(
             authors=[author4, author5],
             ad=ad,
@@ -2213,99 +2257,118 @@ class GenerateDraftAliasesTests(TestCase):
             type="published_rfc",
             time=datetime.datetime(2010, 10, 10, tzinfo=RPC_TZINFO),
         )
-        doc4.relateddocument_set.create(
-            relationship_id="became_rfc", target=rfc4
-        )
+        doc4.relateddocument_set.create(relationship_id="became_rfc", target=rfc4)
         doc5 = IndividualDraftFactory(authors=[author6])
 
-        args = []
-        kwargs = {}
-        out = io.StringIO()
-        call_command("generate_draft_aliases", *args, **kwargs, stdout=out, stderr=out)
-        self.assertFalse(out.getvalue())
-
-        with open(settings.DRAFT_ALIASES_PATH) as afile:
-            acontent = afile.read()
-            for x in [
-                "xfilter-" + doc1.name,
-                "xfilter-" + doc1.name + ".ad",
-                "xfilter-" + doc1.name + ".authors",
-                "xfilter-" + doc1.name + ".shepherd",
-                "xfilter-" + doc1.name + ".all",
-                "xfilter-" + doc2.name,
-                "xfilter-" + doc2.name + ".ad",
-                "xfilter-" + doc2.name + ".authors",
-                "xfilter-" + doc2.name + ".chairs",
-                "xfilter-" + doc2.name + ".all",
-                "xfilter-" + doc3.name,
-                "xfilter-" + doc3.name + ".ad",
-                "xfilter-" + doc3.name + ".authors",
-                "xfilter-" + doc3.name + ".chairs",
-                "xfilter-" + doc5.name,
-                "xfilter-" + doc5.name + ".authors",
-                "xfilter-" + doc5.name + ".all",
-            ]:
-                self.assertIn(x, acontent)
-
-            for x in [
-                "xfilter-" + doc1.name + ".chairs",
-                "xfilter-" + doc2.name + ".shepherd",
-                "xfilter-" + doc3.name + ".shepherd",
-                "xfilter-" + doc4.name,
-                "xfilter-" + doc5.name + ".shepherd",
-                "xfilter-" + doc5.name + ".ad",
-            ]:
-                self.assertNotIn(x, acontent)
-
-        with open(settings.DRAFT_VIRTUAL_PATH) as vfile:
-            vcontent = vfile.read()
-            for x in [
+        output = [(alias, alist) for alias, alist in DraftAliasGenerator()]
+        alias_dict = dict(output)
+        self.assertEqual(len(alias_dict), len(output))  # no duplicate aliases
+        expected_dict = {
+            doc1.name: [author1.email_address()],
+            doc1.name + ".ad": [ad.email_address()],
+            doc1.name + ".authors": [author1.email_address()],
+            doc1.name + ".shepherd": [shepherd.email_address()],
+            doc1.name
+            + ".all": [
+                author1.email_address(),
                 ad.email_address(),
                 shepherd.email_address(),
-                marschairman.email_address(),
-                author1.email_address(),
+            ],
+            doc2.name: [author2.email_address()],
+            doc2.name + ".ad": [ad.email_address()],
+            doc2.name + ".authors": [author2.email_address()],
+            doc2.name + ".chairs": [marschairman.email_address()],
+            doc2.name + ".notify": [ad.email_address()],
+            doc2.name
+            + ".all": [
                 author2.email_address(),
+                ad.email_address(),
+                marschairman.email_address(),
+            ],
+            doc3.name: [author3.email_address()],
+            doc3.name + ".ad": [ad.email_address()],
+            doc3.name + ".authors": [author3.email_address()],
+            doc3.name + ".chairs": [marschairman.email_address()],
+            doc3.name
+            + ".all": [
                 author3.email_address(),
-                author6.email_address(),
-            ]:
-                self.assertIn(x, vcontent)
+                ad.email_address(),
+                marschairman.email_address(),
+            ],
+            doc5.name: [author6.email_address()],
+            doc5.name + ".authors": [author6.email_address()],
+            doc5.name + ".all": [author6.email_address()],
+        }
+        # Sort lists for comparison
+        self.assertEqual(
+            {k: sorted(v) for k, v in alias_dict.items()},
+            {k: sorted(v) for k, v in expected_dict.items()},
+        )
 
-            for x in [
-                author4.email_address(),
-                author5.email_address(),
-            ]:
-                self.assertNotIn(x, vcontent)
+        # check single name
+        output = [(alias, alist) for alias, alist in DraftAliasGenerator(Document.objects.filter(name=doc1.name))]
+        alias_dict = dict(output)
+        self.assertEqual(len(alias_dict), len(output))  # no duplicate aliases
+        expected_dict = {
+            doc1.name: [author1.email_address()],
+            doc1.name + ".ad": [ad.email_address()],
+            doc1.name + ".authors": [author1.email_address()],
+            doc1.name + ".shepherd": [shepherd.email_address()],
+            doc1.name
+            + ".all": [
+                author1.email_address(),
+                ad.email_address(),
+                shepherd.email_address(),
+            ],
+        }
+        # Sort lists for comparison
+        self.assertEqual(
+            {k: sorted(v) for k, v in alias_dict.items()},
+            {k: sorted(v) for k, v in expected_dict.items()},
+        )
 
-            for x in [
-                "xfilter-" + doc1.name,
-                "xfilter-" + doc1.name + ".ad",
-                "xfilter-" + doc1.name + ".authors",
-                "xfilter-" + doc1.name + ".shepherd",
-                "xfilter-" + doc1.name + ".all",
-                "xfilter-" + doc2.name,
-                "xfilter-" + doc2.name + ".ad",
-                "xfilter-" + doc2.name + ".authors",
-                "xfilter-" + doc2.name + ".chairs",
-                "xfilter-" + doc2.name + ".all",
-                "xfilter-" + doc3.name,
-                "xfilter-" + doc3.name + ".ad",
-                "xfilter-" + doc3.name + ".authors",
-                "xfilter-" + doc3.name + ".chairs",
-                "xfilter-" + doc5.name,
-                "xfilter-" + doc5.name + ".authors",
-                "xfilter-" + doc5.name + ".all",
-            ]:
-                self.assertIn(x, vcontent)
+    @override_settings(TOOLS_SERVER="tools.example.org", DRAFT_ALIAS_DOMAIN="draft.example.org")
+    def test_get_draft_notify_emails(self):
+        ad = PersonFactory()
+        shepherd = PersonFactory()
+        author = PersonFactory()
+        doc = DocumentFactory(authors=[author], shepherd=shepherd.email(), ad=ad)
+        generator = DraftAliasGenerator()
 
-            for x in [
-                "xfilter-" + doc1.name + ".chairs",
-                "xfilter-" + doc2.name + ".shepherd",
-                "xfilter-" + doc3.name + ".shepherd",
-                "xfilter-" + doc4.name,
-                "xfilter-" + doc5.name + ".shepherd",
-                "xfilter-" + doc5.name + ".ad",
-            ]:
-                self.assertNotIn(x, vcontent)
+        doc.notify = f"{doc.name}@draft.example.org"
+        doc.save()
+        self.assertCountEqual(generator.get_draft_notify_emails(doc), [author.email_address()])
+
+        doc.notify = f"{doc.name}.ad@draft.example.org"
+        doc.save()
+        self.assertCountEqual(generator.get_draft_notify_emails(doc), [ad.email_address()])
+
+        doc.notify = f"{doc.name}.shepherd@draft.example.org"
+        doc.save()
+        self.assertCountEqual(generator.get_draft_notify_emails(doc), [shepherd.email_address()])
+
+        doc.notify = f"{doc.name}.all@draft.example.org"
+        doc.save()
+        self.assertCountEqual(
+            generator.get_draft_notify_emails(doc),
+            [ad.email_address(), author.email_address(), shepherd.email_address()]
+        )
+
+        doc.notify = f"{doc.name}.notify@draft.example.org"
+        doc.save()
+        self.assertCountEqual(generator.get_draft_notify_emails(doc), [])
+
+        doc.notify = f"{doc.name}.ad@somewhere.example.com"
+        doc.save()
+        self.assertCountEqual(generator.get_draft_notify_emails(doc), [f"{doc.name}.ad@somewhere.example.com"])
+        
+        doc.notify = f"somebody@example.com, nobody@example.com, {doc.name}.ad@tools.example.org"
+        doc.save()
+        self.assertCountEqual(
+            generator.get_draft_notify_emails(doc),
+            ["somebody@example.com", "nobody@example.com", ad.email_address()]
+        )
+
 
 class EmailAliasesTests(TestCase):
 
@@ -2314,37 +2377,20 @@ class EmailAliasesTests(TestCase):
         WgDraftFactory(name='draft-ietf-mars-test',group__acronym='mars')
         WgDraftFactory(name='draft-ietf-ames-test',group__acronym='ames')
         RoleFactory(group__type_id='review', group__acronym='yangdoctors', name_id='secr')
-        self.doc_alias_file = NamedTemporaryFile(delete=False, mode='w+')
-        self.doc_alias_file.write("""# Generated by hand at 2015-02-12_16:26:45
-virtual.ietf.org anything
-draft-ietf-mars-test@ietf.org              xfilter-draft-ietf-mars-test
-expand-draft-ietf-mars-test@virtual.ietf.org  mars-author@example.com, mars-collaborator@example.com
-draft-ietf-mars-test.authors@ietf.org      xfilter-draft-ietf-mars-test.authors
-expand-draft-ietf-mars-test.authors@virtual.ietf.org  mars-author@example.mars, mars-collaborator@example.mars
-draft-ietf-mars-test.chairs@ietf.org      xfilter-draft-ietf-mars-test.chairs
-expand-draft-ietf-mars-test.chairs@virtual.ietf.org  mars-chair@example.mars
-draft-ietf-mars-test.all@ietf.org      xfilter-draft-ietf-mars-test.all
-expand-draft-ietf-mars-test.all@virtual.ietf.org  mars-author@example.mars, mars-collaborator@example.mars, mars-chair@example.mars
-draft-ietf-ames-test@ietf.org              xfilter-draft-ietf-ames-test
-expand-draft-ietf-ames-test@virtual.ietf.org  ames-author@example.com, ames-collaborator@example.com
-draft-ietf-ames-test.authors@ietf.org      xfilter-draft-ietf-ames-test.authors
-expand-draft-ietf-ames-test.authors@virtual.ietf.org  ames-author@example.ames, ames-collaborator@example.ames
-draft-ietf-ames-test.chairs@ietf.org      xfilter-draft-ietf-ames-test.chairs
-expand-draft-ietf-ames-test.chairs@virtual.ietf.org  ames-chair@example.ames
-draft-ietf-ames-test.all@ietf.org      xfilter-draft-ietf-ames-test.all
-expand-draft-ietf-ames-test.all@virtual.ietf.org  ames-author@example.ames, ames-collaborator@example.ames, ames-chair@example.ames
 
-""")
-        self.doc_alias_file.close()
-        self.saved_draft_virtual_path = settings.DRAFT_VIRTUAL_PATH
-        settings.DRAFT_VIRTUAL_PATH = self.doc_alias_file.name
 
-    def tearDown(self):
-        settings.DRAFT_VIRTUAL_PATH = self.saved_draft_virtual_path
-        os.unlink(self.doc_alias_file.name)
-        super().tearDown()
-
-    def testAliases(self):
+    @mock.patch("ietf.doc.views_doc.get_doc_email_aliases")
+    def testAliases(self, mock_get_aliases):
+        mock_get_aliases.return_value = [
+            {"doc_name": "draft-ietf-mars-test", "alias_type": "", "expansion": "mars-author@example.mars, mars-collaborator@example.mars"},
+            {"doc_name": "draft-ietf-mars-test", "alias_type": ".authors", "expansion": "mars-author@example.mars, mars-collaborator@example.mars"},
+            {"doc_name": "draft-ietf-mars-test", "alias_type": ".chairs", "expansion": "mars-chair@example.mars"},
+            {"doc_name": "draft-ietf-mars-test", "alias_type": ".all", "expansion": "mars-author@example.mars, mars-collaborator@example.mars, mars-chair@example.mars"},
+            {"doc_name": "draft-ietf-ames-test", "alias_type": "", "expansion": "ames-author@example.ames, ames-collaborator@example.ames"},
+            {"doc_name": "draft-ietf-ames-test", "alias_type": ".authors", "expansion": "ames-author@example.ames, ames-collaborator@example.ames"},
+            {"doc_name": "draft-ietf-ames-test", "alias_type": ".chairs", "expansion": "ames-chair@example.ames"},
+            {"doc_name": "draft-ietf-ames-test", "alias_type": ".all", "expansion": "ames-author@example.ames, ames-collaborator@example.ames, ames-chair@example.ames"},
+        ]
         PersonFactory(user__username='plain')
         url = urlreverse('ietf.doc.urls.redirect.document_email', kwargs=dict(name="draft-ietf-mars-test"))
         r = self.client.get(url)
@@ -2354,16 +2400,70 @@ expand-draft-ietf-ames-test.all@virtual.ietf.org  ames-author@example.ames, ames
         login_testing_unauthorized(self, "plain", url)
         r = self.client.get(url)
         self.assertEqual(r.status_code, 200)
+        self.assertEqual(mock_get_aliases.call_args, mock.call())
         self.assertTrue(all([x in unicontent(r) for x in ['mars-test@','mars-test.authors@','mars-test.chairs@']]))
         self.assertTrue(all([x in unicontent(r) for x in ['ames-test@','ames-test.authors@','ames-test.chairs@']]))
 
-    def testExpansions(self):
+
+    @mock.patch("ietf.doc.views_doc.get_doc_email_aliases")
+    def testExpansions(self, mock_get_aliases):
+        mock_get_aliases.return_value = [
+            {"doc_name": "draft-ietf-mars-test", "alias_type": "", "expansion": "mars-author@example.mars, mars-collaborator@example.mars"},
+            {"doc_name": "draft-ietf-mars-test", "alias_type": ".authors", "expansion": "mars-author@example.mars, mars-collaborator@example.mars"},
+            {"doc_name": "draft-ietf-mars-test", "alias_type": ".chairs", "expansion": "mars-chair@example.mars"},
+            {"doc_name": "draft-ietf-mars-test", "alias_type": ".all", "expansion": "mars-author@example.mars, mars-collaborator@example.mars, mars-chair@example.mars"},
+        ]
         url = urlreverse('ietf.doc.views_doc.document_email', kwargs=dict(name="draft-ietf-mars-test"))
         r = self.client.get(url)
+        self.assertEqual(mock_get_aliases.call_args, mock.call("draft-ietf-mars-test"))
         self.assertEqual(r.status_code, 200)
         self.assertContains(r, 'draft-ietf-mars-test.all@ietf.org')
         self.assertContains(r, 'iesg_ballot_saved')
+    
+    @mock.patch("ietf.doc.utils.DraftAliasGenerator")
+    def test_get_doc_email_aliases(self, mock_alias_gen_cls):
+        mock_alias_gen_cls.return_value = [
+            ("draft-something-or-other.some-type", ["somebody@example.com"]),
+            ("draft-something-or-other", ["somebody@example.com"]),
+            ("draft-nothing-at-all", ["nobody@example.com"]),
+            ("draft-nothing-at-all.some-type", ["nobody@example.com"]),
+        ]
+        # order is important in the response - should be sorted by doc name and otherwise left
+        # in order
+        self.assertEqual(
+            get_doc_email_aliases(),
+            [
+                {
+                    "doc_name": "draft-nothing-at-all",
+                    "alias_type": "",
+                    "expansion": "nobody@example.com",
+                },
+                {
+                    "doc_name": "draft-nothing-at-all",
+                    "alias_type": ".some-type",
+                    "expansion": "nobody@example.com",
+                },
+                {
+                    "doc_name": "draft-something-or-other",
+                    "alias_type": ".some-type",
+                    "expansion": "somebody@example.com",
+                },
+                {
+                    "doc_name": "draft-something-or-other",
+                    "alias_type": "",
+                    "expansion": "somebody@example.com",
+                },
+            ],
+        )
+        self.assertEqual(mock_alias_gen_cls.call_args, mock.call(None))
 
+        # Repeat with a name, no need to re-test that the alias list is actually passed through, just
+        # check that the DraftAliasGenerator is called correctly
+        draft = WgDraftFactory()
+        get_doc_email_aliases(draft.name)
+        self.assertQuerySetEqual(mock_alias_gen_cls.call_args[0][0], Document.objects.filter(pk=draft.pk))
+        
+        
 class DocumentMeetingTests(TestCase):
 
     def setUp(self):
@@ -2386,8 +2486,8 @@ class DocumentMeetingTests(TestCase):
 
     def test_view_document_meetings(self):
         doc = IndividualDraftFactory.create()
-        doc.sessionpresentation_set.create(session=self.inprog,rev=None)
-        doc.sessionpresentation_set.create(session=self.interim,rev=None)
+        doc.presentations.create(session=self.inprog,rev=None)
+        doc.presentations.create(session=self.interim,rev=None)
 
         url = urlreverse('ietf.doc.views_doc.all_presentations', kwargs=dict(name=doc.name))
         response = self.client.get(url)
@@ -2398,8 +2498,8 @@ class DocumentMeetingTests(TestCase):
         self.assertFalse(q('#addsessionsbutton'))
         self.assertFalse(q("a.btn:contains('Remove document')"))
 
-        doc.sessionpresentation_set.create(session=self.past_cutoff,rev=None)
-        doc.sessionpresentation_set.create(session=self.past,rev=None)
+        doc.presentations.create(session=self.past_cutoff,rev=None)
+        doc.presentations.create(session=self.past,rev=None)
 
         self.client.login(username="secretary", password="secretary+password")
         response = self.client.get(url)
@@ -2432,41 +2532,72 @@ class DocumentMeetingTests(TestCase):
         self.assertFalse(q("#futuremeets a.btn:contains('Remove document')"))
         self.assertFalse(q("#pastmeets a.btn:contains('Remove document')"))
 
-    def test_edit_document_session(self):
+    @override_settings(MEETECHO_API_CONFIG="fake settings")
+    @mock.patch("ietf.doc.views_doc.SlidesManager")
+    def test_edit_document_session(self, mock_slides_manager_cls):
         doc = IndividualDraftFactory.create()
-        sp = doc.sessionpresentation_set.create(session=self.future,rev=None)
+        sp = doc.presentations.create(session=self.future,rev=None)
 
         url = urlreverse('ietf.doc.views_doc.edit_sessionpresentation',kwargs=dict(name='no-such-doc',session_id=sp.session_id))
         response = self.client.get(url)
         self.assertEqual(response.status_code, 404)
+        self.assertFalse(mock_slides_manager_cls.called)
 
         url = urlreverse('ietf.doc.views_doc.edit_sessionpresentation',kwargs=dict(name=doc.name,session_id=0))
         response = self.client.get(url)
         self.assertEqual(response.status_code, 404)
+        self.assertFalse(mock_slides_manager_cls.called)
 
         url = urlreverse('ietf.doc.views_doc.edit_sessionpresentation',kwargs=dict(name=doc.name,session_id=sp.session_id))
         response = self.client.get(url)
         self.assertEqual(response.status_code, 404)
+        self.assertFalse(mock_slides_manager_cls.called)
 
         self.client.login(username=self.other_chair.user.username,password='%s+password'%self.other_chair.user.username)
         response = self.client.get(url)
         self.assertEqual(response.status_code, 404)
-        
+        self.assertFalse(mock_slides_manager_cls.called)
+
         self.client.login(username=self.group_chair.user.username,password='%s+password'%self.group_chair.user.username)
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
         q = PyQuery(response.content)
         self.assertEqual(2,len(q('select#id_version option')))
+        self.assertFalse(mock_slides_manager_cls.called)
 
+        # edit draft
         self.assertEqual(1,doc.docevent_set.count())
         response = self.client.post(url,{'version':'00','save':''})
         self.assertEqual(response.status_code, 302)
-        self.assertEqual(doc.sessionpresentation_set.get(pk=sp.pk).rev,'00')
+        self.assertEqual(doc.presentations.get(pk=sp.pk).rev,'00')
         self.assertEqual(2,doc.docevent_set.count())
+        self.assertFalse(mock_slides_manager_cls.called)
+
+        # editing slides should call Meetecho API
+        slides = SessionPresentationFactory(
+            session=self.future,
+            document__type_id="slides",
+            document__rev="00",
+            rev=None,
+            order=1,
+        ).document
+        url = urlreverse(
+            "ietf.doc.views_doc.edit_sessionpresentation",
+            kwargs={"name": slides.name, "session_id": self.future.pk},
+        )
+        response = self.client.post(url, {"version": "00", "save": ""})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(mock_slides_manager_cls.call_count, 1)
+        self.assertEqual(mock_slides_manager_cls.call_args, mock.call(api_config="fake settings"))
+        self.assertEqual(mock_slides_manager_cls.return_value.send_update.call_count, 1)
+        self.assertEqual(
+            mock_slides_manager_cls.return_value.send_update.call_args,
+            mock.call(self.future),
+        )
 
     def test_edit_document_session_after_proceedings_closed(self):
         doc = IndividualDraftFactory.create()
-        sp = doc.sessionpresentation_set.create(session=self.past_cutoff,rev=None)
+        sp = doc.presentations.create(session=self.past_cutoff,rev=None)
 
         url = urlreverse('ietf.doc.views_doc.edit_sessionpresentation',kwargs=dict(name=doc.name,session_id=sp.session_id))
         self.client.login(username=self.group_chair.user.username,password='%s+password'%self.group_chair.user.username)
@@ -2479,39 +2610,64 @@ class DocumentMeetingTests(TestCase):
         q=PyQuery(response.content)
         self.assertEqual(1,len(q(".alert-warning:contains('may affect published proceedings')")))
 
-    def test_remove_document_session(self):
+    @override_settings(MEETECHO_API_CONFIG="fake settings")
+    @mock.patch("ietf.doc.views_doc.SlidesManager")
+    def test_remove_document_session(self, mock_slides_manager_cls):
         doc = IndividualDraftFactory.create()
-        sp = doc.sessionpresentation_set.create(session=self.future,rev=None)
+        sp = doc.presentations.create(session=self.future,rev=None)
 
         url = urlreverse('ietf.doc.views_doc.remove_sessionpresentation',kwargs=dict(name='no-such-doc',session_id=sp.session_id))
         response = self.client.get(url)
         self.assertEqual(response.status_code, 404)
+        self.assertFalse(mock_slides_manager_cls.called)
 
         url = urlreverse('ietf.doc.views_doc.remove_sessionpresentation',kwargs=dict(name=doc.name,session_id=0))
         response = self.client.get(url)
         self.assertEqual(response.status_code, 404)
+        self.assertFalse(mock_slides_manager_cls.called)
 
         url = urlreverse('ietf.doc.views_doc.remove_sessionpresentation',kwargs=dict(name=doc.name,session_id=sp.session_id))
         response = self.client.get(url)
         self.assertEqual(response.status_code, 404)
+        self.assertFalse(mock_slides_manager_cls.called)
 
         self.client.login(username=self.other_chair.user.username,password='%s+password'%self.other_chair.user.username)
         response = self.client.get(url)
         self.assertEqual(response.status_code, 404)
-        
+        self.assertFalse(mock_slides_manager_cls.called)
+
         self.client.login(username=self.group_chair.user.username,password='%s+password'%self.group_chair.user.username)
         response = self.client.get(url)
         self.assertEqual(response.status_code, 200)
+        self.assertFalse(mock_slides_manager_cls.called)
 
+        # removing a draft
         self.assertEqual(1,doc.docevent_set.count())
         response = self.client.post(url,{'remove_session':''})
         self.assertEqual(response.status_code, 302)
-        self.assertFalse(doc.sessionpresentation_set.filter(pk=sp.pk).exists())
+        self.assertFalse(doc.presentations.filter(pk=sp.pk).exists())
         self.assertEqual(2,doc.docevent_set.count())
+        self.assertFalse(mock_slides_manager_cls.called)
+
+        # removing slides should call Meetecho API
+        slides = SessionPresentationFactory(session=self.future, document__type_id="slides", order=1).document
+        url = urlreverse(
+            "ietf.doc.views_doc.remove_sessionpresentation",
+            kwargs={"name": slides.name, "session_id": self.future.pk},
+        )
+        response = self.client.post(url, {"remove_session": ""})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(mock_slides_manager_cls.call_count, 1)
+        self.assertEqual(mock_slides_manager_cls.call_args, mock.call(api_config="fake settings"))
+        self.assertEqual(mock_slides_manager_cls.return_value.delete.call_count, 1)
+        self.assertEqual(
+            mock_slides_manager_cls.return_value.delete.call_args,
+            mock.call(self.future, slides),
+        )
 
     def test_remove_document_session_after_proceedings_closed(self):
         doc = IndividualDraftFactory.create()
-        sp = doc.sessionpresentation_set.create(session=self.past_cutoff,rev=None)
+        sp = doc.presentations.create(session=self.past_cutoff,rev=None)
 
         url = urlreverse('ietf.doc.views_doc.remove_sessionpresentation',kwargs=dict(name=doc.name,session_id=sp.session_id))
         self.client.login(username=self.group_chair.user.username,password='%s+password'%self.group_chair.user.username)
@@ -2524,28 +2680,49 @@ class DocumentMeetingTests(TestCase):
         q=PyQuery(response.content)
         self.assertEqual(1,len(q(".alert-warning:contains('may affect published proceedings')")))
 
-    def test_add_document_session(self):
+    @override_settings(MEETECHO_API_CONFIG="fake settings")
+    @mock.patch("ietf.doc.views_doc.SlidesManager")
+    def test_add_document_session(self, mock_slides_manager_cls):
         doc = IndividualDraftFactory.create()
 
         url = urlreverse('ietf.doc.views_doc.add_sessionpresentation',kwargs=dict(name=doc.name))
         login_testing_unauthorized(self,self.group_chair.user.username,url)
         response = self.client.get(url)
         self.assertEqual(response.status_code,200)
-    
+        self.assertFalse(mock_slides_manager_cls.called)
+
         response = self.client.post(url,{'session':0,'version':'current'})
         self.assertEqual(response.status_code,200)
         q=PyQuery(response.content)
         self.assertTrue(q('.form-select.is-invalid'))
+        self.assertFalse(mock_slides_manager_cls.called)
 
         response = self.client.post(url,{'session':self.future.pk,'version':'bogus version'})
         self.assertEqual(response.status_code,200)
         q=PyQuery(response.content)
         self.assertTrue(q('.form-select.is-invalid'))
+        self.assertFalse(mock_slides_manager_cls.called)
 
+        # adding a draft
         self.assertEqual(1,doc.docevent_set.count())
         response = self.client.post(url,{'session':self.future.pk,'version':'current'})
         self.assertEqual(response.status_code,302)
         self.assertEqual(2,doc.docevent_set.count())
+        self.assertEqual(doc.presentations.get(session__pk=self.future.pk).order, 0)
+        self.assertFalse(mock_slides_manager_cls.called)
+
+        # adding slides should set order / call Meetecho API
+        slides = DocumentFactory(type_id="slides")
+        url = urlreverse("ietf.doc.views_doc.add_sessionpresentation", kwargs=dict(name=slides.name))
+        response = self.client.post(url, {"session": self.future.pk, "version": "current"})
+        self.assertEqual(response.status_code,302)
+        self.assertEqual(slides.presentations.get(session__pk=self.future.pk).order, 1)
+        self.assertEqual(mock_slides_manager_cls.call_args, mock.call(api_config="fake settings"))
+        self.assertEqual(mock_slides_manager_cls.return_value.add.call_count, 1)
+        self.assertEqual(
+            mock_slides_manager_cls.return_value.add.call_args,
+            mock.call(self.future, slides, order=1),
+        )
 
     def test_get_related_meeting(self):
         """Should be able to retrieve related meeting"""
@@ -2578,60 +2755,6 @@ class DocumentMeetingTests(TestCase):
                 self.assertIsNone(doc.get_related_meeting(), f'{doc.type.slug} should not be related to meeting')
 
 class ChartTests(ResourceTestCaseMixin, TestCase):
-    def test_search_chart_conf(self):
-        doc = IndividualDraftFactory()
-
-        conf_url = urlreverse('ietf.doc.views_stats.chart_conf_newrevisiondocevent')
-
-        # No qurey arguments; expect an empty json object
-        r = self.client.get(conf_url)
-        self.assertValidJSONResponse(r)
-        self.assertEqual(unicontent(r), '{}')
-
-        # No match
-        r = self.client.get(conf_url + '?activedrafts=on&name=thisisnotadocumentname')
-        self.assertValidJSONResponse(r)
-        d = r.json()
-        self.assertEqual(d['chart']['type'], settings.CHART_TYPE_COLUMN_OPTIONS['chart']['type'])
-
-        r = self.client.get(conf_url + '?activedrafts=on&name=%s'%doc.name[6:12])
-        self.assertValidJSONResponse(r)
-        d = r.json()
-        self.assertEqual(d['chart']['type'], settings.CHART_TYPE_COLUMN_OPTIONS['chart']['type'])
-        self.assertEqual(len(d['series'][0]['data']), 0)
-
-    def test_search_chart_data(self):
-        doc = IndividualDraftFactory()
-
-        data_url = urlreverse('ietf.doc.views_stats.chart_data_newrevisiondocevent')
-
-        # No qurey arguments; expect an empty json list
-        r = self.client.get(data_url)
-        self.assertValidJSONResponse(r)
-        self.assertEqual(unicontent(r), '[]')
-
-        # No match
-        r = self.client.get(data_url + '?activedrafts=on&name=thisisnotadocumentname')
-        self.assertValidJSONResponse(r)
-        d = r.json()
-        self.assertEqual(unicontent(r), '[]')
-
-        r = self.client.get(data_url + '?activedrafts=on&name=%s'%doc.name[6:12])
-        self.assertValidJSONResponse(r)
-        d = r.json()
-        self.assertEqual(len(d), 1)
-        self.assertEqual(len(d[0]), 2)
-
-    def test_search_chart(self):
-        doc = IndividualDraftFactory()
-
-        chart_url = urlreverse('ietf.doc.views_stats.chart_newrevisiondocevent')
-        r = self.client.get(chart_url)
-        self.assertEqual(r.status_code, 200)
-
-        r = self.client.get(chart_url + '?activedrafts=on&name=%s'%doc.name[6:12])
-        self.assertEqual(r.status_code, 200)
-        
     def test_personal_chart(self):
         person = PersonFactory.create()
         IndividualDraftFactory.create(
@@ -2738,32 +2861,40 @@ class MaterialsTests(TestCase):
 class Idnits2SupportTests(TestCase):
     settings_temp_path_overrides = TestCase.settings_temp_path_overrides + ['DERIVED_DIR']
 
-    def test_obsoleted(self):
+    def test_generate_idnits2_rfcs_obsoleted(self):
         rfc = WgRfcFactory(rfc_number=1001)
         WgRfcFactory(rfc_number=1003,relations=[('obs',rfc)])
         rfc = WgRfcFactory(rfc_number=1005)
         WgRfcFactory(rfc_number=1007,relations=[('obs',rfc)])
+        blob = generate_idnits2_rfcs_obsoleted()
+        self.assertEqual(blob, b'1001 1003\n1005 1007\n'.decode("utf8"))
 
+    def test_obsoleted(self):
         url = urlreverse('ietf.doc.views_doc.idnits2_rfcs_obsoleted')
         r = self.client.get(url)
         self.assertEqual(r.status_code, 404)
-        call_command('generate_idnits2_rfcs_obsoleted')
+        # value written is arbitrary, expect it to be passed through
+        (Path(settings.DERIVED_DIR) / "idnits2-rfcs-obsoleted").write_bytes(b'1001 1003\n1005 1007\n')
         url = urlreverse('ietf.doc.views_doc.idnits2_rfcs_obsoleted')
         r = self.client.get(url)
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.content, b'1001 1003\n1005 1007\n')
 
-    def test_rfc_status(self):
+    def test_generate_idnits2_rfc_status(self):
         for slug in ('bcp', 'ds', 'exp', 'hist', 'inf', 'std', 'ps', 'unkn'):
             WgRfcFactory(std_level_id=slug)
+        blob = generate_idnits2_rfc_status().replace("\n", "")
+        self.assertEqual(blob[6312-1], "O")
+
+    def test_rfc_status(self):
         url = urlreverse('ietf.doc.views_doc.idnits2_rfc_status')
         r = self.client.get(url)
         self.assertEqual(r.status_code,404)
-        call_command('generate_idnits2_rfc_status')
+        # value written is arbitrary, expect it to be passed through
+        (Path(settings.DERIVED_DIR) / "idnits2-rfc-status").write_bytes(b'1001 1003\n1005 1007\n')
         r = self.client.get(url)
         self.assertEqual(r.status_code,200)
-        blob = unicontent(r).replace('\n','')
-        self.assertEqual(blob[6312-1],'O')
+        self.assertEqual(r.content, b'1001 1003\n1005 1007\n')
 
     def test_idnits2_state(self):
         rfc = WgRfcFactory()
@@ -2865,6 +2996,13 @@ class PdfizedTests(TestCase):
             with (Path(dir) / f'{draft.name}-{r:02d}.txt').open('w') as f:
                 f.write('text content')
 
+        self.assertTrue(
+            login_testing_unauthorized(
+                self,
+                PersonFactory().user.username,
+                urlreverse(self.view, kwargs={"name": draft.name}),
+            )
+        )
         self.should_succeed(dict(name=rfc.name))
         self.should_succeed(dict(name=draft.name))
         for r in range(0,2):
@@ -3034,3 +3172,309 @@ class DocInfoMethodsTests(TestCase):
             rfc.referenced_by_rfcs_as_rfc_or_draft(),
             draft.targets_related.filter(source__type="rfc") | rfc.targets_related.filter(source__type="rfc"),
         )
+
+class StateIndexTests(TestCase):
+
+    def test_state_index(self):
+        url = urlreverse('ietf.doc.views_help.state_index')
+        r = self.client.get(url)
+        q = PyQuery(r.content)
+        content = [ e.text for e in q('#content table td a ') ]
+        names = StateType.objects.values_list('slug', flat=True)
+        # The following doesn't cover all doc types, only a selection
+        for name in names:
+            if not '-' in name:
+                self.assertIn(name, content)
+
+class InvestigateTests(TestCase):
+    settings_temp_path_overrides = TestCase.settings_temp_path_overrides + [
+        "AGENDA_PATH",
+        # "INTERNET_DRAFT_PATH",
+        # "INTERNET_DRAFT_ARCHIVE_DIR",
+        # "INTERNET_ALL_DRAFTS_ARCHIVE_DIR",
+    ]
+
+    def setUp(self):
+        super().setUp()
+        # Contort the draft archive dir temporary replacement
+        # to match the "collections" concept
+        archive_tmp_dir = Path(settings.INTERNET_DRAFT_ARCHIVE_DIR)
+        new_archive_dir = archive_tmp_dir / "draft-archive"
+        new_archive_dir.mkdir()
+        settings.INTERNET_DRAFT_ARCHIVE_DIR = str(new_archive_dir)
+        donated_personal_copy_dir = archive_tmp_dir / "donated-personal-copy"
+        donated_personal_copy_dir.mkdir()
+        meeting_dir = Path(settings.AGENDA_PATH) / "666"
+        meeting_dir.mkdir()
+        all_archive_dir = Path(settings.INTERNET_ALL_DRAFTS_ARCHIVE_DIR)
+        repository_dir = Path(settings.INTERNET_DRAFT_PATH)
+
+        for path in [repository_dir, all_archive_dir]:
+            (path / "draft-this-is-active-00.txt").touch()
+        for path in [new_archive_dir, all_archive_dir]:
+            (path / "draft-old-but-can-authenticate-00.txt").touch()
+            (path / "draft-has-mixed-provenance-01.txt").touch()
+        for path in [donated_personal_copy_dir, all_archive_dir]:
+            (path / "draft-donated-from-a-personal-collection-00.txt").touch()
+            (path / "draft-has-mixed-provenance-00.txt").touch()
+            (path / "draft-has-mixed-provenance-00.txt.Z").touch()
+        (all_archive_dir / "draft-this-should-not-be-possible-00.txt").touch()
+        (meeting_dir / "draft-this-predates-the-archive-00.txt").touch()
+
+    def test_investigate_fragment(self):
+
+        result = investigate_fragment("this-is-active")
+        self.assertEqual(len(result["can_verify"]), 1)
+        self.assertEqual(len(result["unverifiable_collections"]), 0)
+        self.assertEqual(len(result["unexpected"]), 0)
+        self.assertEqual(
+            list(result["can_verify"])[0].name, "draft-this-is-active-00.txt"
+        )
+
+        result = investigate_fragment("old-but-can")
+        self.assertEqual(len(result["can_verify"]), 1)
+        self.assertEqual(len(result["unverifiable_collections"]), 0)
+        self.assertEqual(len(result["unexpected"]), 0)
+        self.assertEqual(
+            list(result["can_verify"])[0].name, "draft-old-but-can-authenticate-00.txt"
+        )
+
+        result = investigate_fragment("predates")
+        self.assertEqual(len(result["can_verify"]), 1)
+        self.assertEqual(len(result["unverifiable_collections"]), 0)
+        self.assertEqual(len(result["unexpected"]), 0)
+        self.assertEqual(
+            list(result["can_verify"])[0].name, "draft-this-predates-the-archive-00.txt"
+        )
+
+        result = investigate_fragment("personal-collection")
+        self.assertEqual(len(result["can_verify"]), 0)
+        self.assertEqual(len(result["unverifiable_collections"]), 1)
+        self.assertEqual(len(result["unexpected"]), 0)
+        self.assertEqual(
+            list(result["unverifiable_collections"])[0].name,
+            "draft-donated-from-a-personal-collection-00.txt",
+        )
+
+        result = investigate_fragment("mixed-provenance")
+        self.assertEqual(len(result["can_verify"]), 1)
+        self.assertEqual(len(result["unverifiable_collections"]), 2)
+        self.assertEqual(len(result["unexpected"]), 0)
+        self.assertEqual(
+            list(result["can_verify"])[0].name, "draft-has-mixed-provenance-01.txt"
+        )
+        self.assertEqual(
+            set([p.name for p in result["unverifiable_collections"]]),
+            set(
+                [
+                    "draft-has-mixed-provenance-00.txt",
+                    "draft-has-mixed-provenance-00.txt.Z",
+                ]
+            ),
+        )
+
+        result = investigate_fragment("not-be-possible")
+        self.assertEqual(len(result["can_verify"]), 0)
+        self.assertEqual(len(result["unverifiable_collections"]), 0)
+        self.assertEqual(len(result["unexpected"]), 1)
+        self.assertEqual(
+            list(result["unexpected"])[0].name,
+            "draft-this-should-not-be-possible-00.txt",
+        )
+
+    @mock.patch("ietf.doc.utils.caches")
+    def test_investigate_fragment_cache(self, mock_caches):
+        """investigate_fragment should cache its result"""
+        mock_default_cache = mock_caches["default"]
+        mock_default_cache.get.return_value = None  # disable cache
+        result = investigate_fragment("this-is-active")
+        self.assertEqual(len(result["can_verify"]), 1)
+        self.assertEqual(len(result["unverifiable_collections"]), 0)
+        self.assertEqual(len(result["unexpected"]), 0)
+        self.assertEqual(
+            list(result["can_verify"])[0].name, "draft-this-is-active-00.txt"
+        )
+        self.assertTrue(mock_default_cache.get.called)
+        self.assertTrue(mock_default_cache.set.called)
+        expected_key = f"investigate_fragment:{sha384(b'this-is-active').hexdigest()}"
+        self.assertEqual(mock_default_cache.set.call_args.kwargs["key"], expected_key)
+        cached_value = mock_default_cache.set.call_args.kwargs["value"]  # hang on to this
+        mock_default_cache.reset_mock()
+
+        # Check that a cached value is used
+        mock_default_cache.get.return_value = cached_value
+        with mock.patch("ietf.doc.utils.Path") as mock_path:
+            result = investigate_fragment("this-is-active")
+        # Check that we got the same results
+        self.assertEqual(len(result["can_verify"]), 1)
+        self.assertEqual(len(result["unverifiable_collections"]), 0)
+        self.assertEqual(len(result["unexpected"]), 0)
+        self.assertEqual(
+            list(result["can_verify"])[0].name, "draft-this-is-active-00.txt"
+        )
+        # And that we used the cache
+        self.assertFalse(mock_path.called)  # a proxy for "did the method do any real work"
+        self.assertTrue(mock_default_cache.get.called)
+        self.assertEqual(mock_default_cache.get.call_args, mock.call(expected_key))
+
+    def test_investigate_get(self):
+        """GET with no querystring should retrieve the investigate UI"""
+        url = urlreverse("ietf.doc.views_doc.investigate")
+        login_testing_unauthorized(self, "secretary", url)
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        q = PyQuery(r.content)
+        self.assertEqual(len(q("form#investigate")), 1)
+        self.assertEqual(len(q("div#results")), 0)
+
+    @mock.patch("ietf.doc.views_doc.AsyncResult")
+    def test_investgate_get_task_id(self, mock_asyncresult):
+        """GET with querystring should lookup task status"""
+        url = urlreverse("ietf.doc.views_doc.investigate")
+        login_testing_unauthorized(self, "secretary", url)
+        mock_asyncresult.return_value.ready.return_value = True
+        r = self.client.get(url + "?id=a-task-id")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json(), {"status": "ready"})
+        self.assertTrue(mock_asyncresult.called)
+        self.assertEqual(mock_asyncresult.call_args, mock.call("a-task-id"))
+        mock_asyncresult.reset_mock()
+
+        mock_asyncresult.return_value.ready.return_value = False
+        r = self.client.get(url + "?id=a-task-id")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json(), {"status": "notready"})
+        self.assertTrue(mock_asyncresult.called)
+        self.assertEqual(mock_asyncresult.call_args, mock.call("a-task-id"))
+
+    @mock.patch("ietf.doc.views_doc.investigate_fragment_task")
+    def test_investigate_post(self, mock_investigate_fragment_task):
+        """POST with a name_fragment and no task_id should start a celery task"""
+        url = urlreverse("ietf.doc.views_doc.investigate")
+        login_testing_unauthorized(self, "secretary", url)
+
+        # test some invalid cases
+        r = self.client.post(url, {"name_fragment": "short"})  # limit is >= 8 characters
+        self.assertEqual(r.status_code, 200)
+        q = PyQuery(r.content)
+        self.assertEqual(len(q("#id_name_fragment.is-invalid")), 1)
+        self.assertFalse(mock_investigate_fragment_task.delay.called)
+        for char in ["*", "%", "/", "\\"]:
+            r = self.client.post(url, {"name_fragment": f"bad{char}character"})
+            self.assertEqual(r.status_code, 200)
+            q = PyQuery(r.content)
+            self.assertEqual(len(q("#id_name_fragment.is-invalid")), 1)
+            self.assertFalse(mock_investigate_fragment_task.delay.called)
+        
+        # now a valid one
+        mock_investigate_fragment_task.delay.return_value.id = "a-task-id"
+        r = self.client.post(url, {"name_fragment": "this-is-a-valid-fragment"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(mock_investigate_fragment_task.delay.called)
+        self.assertEqual(mock_investigate_fragment_task.delay.call_args, mock.call("this-is-a-valid-fragment"))
+        self.assertEqual(r.json(), {"id": "a-task-id"})
+
+    @mock.patch("ietf.doc.views_doc.AsyncResult")
+    def test_investigate_post_task_id(self, mock_asyncresult):
+        """POST with name_fragment and task_id should retrieve results"""
+        url = urlreverse("ietf.doc.views_doc.investigate")
+        login_testing_unauthorized(self, "secretary", url)
+
+        # First, test a non-successful result - this could be a failure or non-existent task id
+        mock_result = mock_asyncresult.return_value
+        mock_result.successful.return_value = False
+        r = self.client.post(url, {"name_fragment": "some-fragment", "task_id": "a-task-id"})
+        self.assertContains(r, "The investigation task failed.", status_code=200)
+        self.assertTrue(mock_asyncresult.called)
+        self.assertEqual(mock_asyncresult.call_args, mock.call("a-task-id"))
+        self.assertFalse(mock_result.get.called)
+        mock_asyncresult.reset_mock()
+        q = PyQuery(r.content)
+        self.assertEqual(q("#id_name_fragment").val(), "some-fragment")
+        self.assertEqual(q("#id_task_id").val(), "a-task-id")
+
+        # now the various successful result mixes
+        mock_result = mock_asyncresult.return_value
+        mock_result.successful.return_value = True
+        mock_result.get.return_value = {
+            "name_fragment": "different-fragment",
+            "results": {
+                "can_verify": set(),
+                "unverifiable_collections": set(),
+                "unexpected": set(),
+            }
+        }
+        r = self.client.post(url, {"name_fragment": "some-fragment", "task_id": "a-task-id"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(mock_asyncresult.called)
+        self.assertEqual(mock_asyncresult.call_args, mock.call("a-task-id"))
+        mock_asyncresult.reset_mock()
+        q = PyQuery(r.content)
+        self.assertEqual(q("#id_name_fragment").val(), "different-fragment", "name_fragment should be reset")
+        self.assertEqual(q("#id_task_id").val(), "", "task_id should be cleared")
+        self.assertEqual(len(q("div#results")), 1)
+        self.assertEqual(len(q("table#authenticated")), 0)
+        self.assertEqual(len(q("table#unverifiable")), 0)
+        self.assertEqual(len(q("table#unexpected")), 0)
+
+        # This file was created in setUp. It allows the view to render properly
+        # but its location / content don't matter for this test otherwise.
+        a_file_that_exists = Path(settings.INTERNET_DRAFT_PATH) / "draft-this-is-active-00.txt"
+
+        mock_result.get.return_value = {
+            "name_fragment": "different-fragment",
+            "results": {
+                "can_verify": {a_file_that_exists},
+                "unverifiable_collections": {a_file_that_exists},
+                "unexpected": set(),
+            }
+        }
+        r = self.client.post(url, {"name_fragment": "some-fragment", "task_id": "a-task-id"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(mock_asyncresult.called)
+        self.assertEqual(mock_asyncresult.call_args, mock.call("a-task-id"))
+        mock_asyncresult.reset_mock()
+        q = PyQuery(r.content)
+        self.assertEqual(q("#id_name_fragment").val(), "different-fragment", "name_fragment should be reset")
+        self.assertEqual(q("#id_task_id").val(), "", "task_id should be cleared")
+        self.assertEqual(len(q("div#results")), 1)
+        self.assertEqual(len(q("table#authenticated")), 1)
+        self.assertEqual(len(q("table#unverifiable")), 1)
+        self.assertEqual(len(q("table#unexpected")), 0)
+
+        mock_result.get.return_value = {
+            "name_fragment": "different-fragment",
+            "results": {
+                "can_verify": set(),
+                "unverifiable_collections": set(),
+                "unexpected": {a_file_that_exists},
+            }
+        }
+        r = self.client.post(url, {"name_fragment": "some-fragment", "task_id": "a-task-id"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(mock_asyncresult.called)
+        self.assertEqual(mock_asyncresult.call_args, mock.call("a-task-id"))
+        mock_asyncresult.reset_mock()
+        q = PyQuery(r.content)
+        self.assertEqual(q("#id_name_fragment").val(), "different-fragment", "name_fragment should be reset")
+        self.assertEqual(q("#id_task_id").val(), "", "task_id should be cleared")
+        self.assertEqual(len(q("div#results")), 1)
+        self.assertEqual(len(q("table#authenticated")), 0)
+        self.assertEqual(len(q("table#unverifiable")), 0)
+        self.assertEqual(len(q("table#unexpected")), 1)
+
+
+class LogIOErrorTests(TestCase):
+
+    def test_doc_text_io_error(self):
+
+        d = IndividualDraftFactory()
+
+        with mock.patch("ietf.doc.models.Path") as path_cls_mock:
+            with mock.patch("ietf.doc.models.log.log") as log_mock:
+                path_cls_mock.return_value.exists.return_value = True
+                path_cls_mock.return_value.open.return_value.__enter__.return_value.read.side_effect = IOError("Bad things happened")
+                text = d.text()
+                self.assertIsNone(text)
+                self.assertTrue(log_mock.called)
+                self.assertIn("Bad things happened", log_mock.call_args[0][0])

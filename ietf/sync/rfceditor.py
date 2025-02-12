@@ -21,7 +21,7 @@ import debug                            # pyflakes:ignore
 from ietf.doc.models import ( Document, State, StateType, DocEvent, DocRelationshipName,
     DocTagName, RelatedDocument, RelatedDocHistory )
 from ietf.doc.expire import move_draft_files_to_archive
-from ietf.doc.utils import add_state_change_event, prettify_std_name, update_action_holders
+from ietf.doc.utils import add_state_change_event, new_state_change_event, prettify_std_name, update_action_holders
 from ietf.group.models import Group
 from ietf.ipr.models import IprDocRel
 from ietf.name.models import StdLevelName, StreamName
@@ -202,11 +202,14 @@ def update_drafts_from_queue(drafts):
         if prev_state != next_state:
             d.set_state(next_state)
 
-            e = add_state_change_event(d, system, prev_state, next_state)
+            e = new_state_change_event(d, system, prev_state, next_state)  # unsaved
+            if e:
+                if auth48:
+                    e.desc = re.sub(r"(<b>.*</b>)", "<a href=\"%s\">\\1</a>" % auth48, e.desc)
+                e.save()
+                events.append(e)
 
             if auth48:
-                e.desc = re.sub(r"(<b>.*</b>)", "<a href=\"%s\">\\1</a>" % auth48, e.desc)
-                e.save()
                 # Create or update the auth48 URL whether or not this is a state expected to have one.
                 d.documenturl_set.update_or_create(
                     tag_id='auth48',  # look up existing based on this field
@@ -215,8 +218,6 @@ def update_drafts_from_queue(drafts):
             else:
                 # Remove any existing auth48 URL when an update does not have one.
                 d.documenturl_set.filter(tag_id='auth48').delete()
-            if e:
-                events.append(e)
 
             changed.add(name)
 
@@ -336,12 +337,12 @@ def parse_index(response):
 
 
 def update_docs_from_rfc_index(
-    index_data, errata_data, skip_older_than_date=None
+    index_data, errata_data, skip_older_than_date: Optional[datetime.date] = None
 ) -> Iterator[tuple[int, list[str], Document, bool]]:
     """Given parsed data from the RFC Editor index, update the documents in the database
 
     Returns an iterator that yields (rfc_number, change_list, doc, rfc_published) for the
-    RFC document and, if applicable, the I-D that it came from.   
+    RFC document and, if applicable, the I-D that it came from.
 
     The skip_older_than_date is a bare date, not a datetime.
     """
@@ -372,6 +373,7 @@ def update_docs_from_rfc_index(
         "INDEPENDENT": StreamName.objects.get(slug="ise"),
         "IRTF": StreamName.objects.get(slug="irtf"),
         "IAB": StreamName.objects.get(slug="iab"),
+        "Editorial": StreamName.objects.get(slug="editorial"),
         "Legacy": StreamName.objects.get(slug="legacy"),
     }
 
@@ -405,7 +407,8 @@ def update_docs_from_rfc_index(
         abstract,
     ) in index_data:
         if skip_older_than_date and rfc_published_date < skip_older_than_date:
-            # speed up the process by skipping old entries
+            # speed up the process by skipping old entries (n.b., the comparison above is a
+            # lexical comparison between "YYYY-MM-DD"-formatted dates)
             continue
 
         # we assume two things can happen: we get a new RFC, or an
@@ -462,6 +465,14 @@ def update_docs_from_rfc_index(
             doc.set_state(rfc_published_state)
             if draft:
                 doc.formal_languages.set(draft.formal_languages.all())
+                for author in draft.documentauthor_set.all():
+                    # Copy the author but point at the new doc. 
+                    # See https://docs.djangoproject.com/en/4.2/topics/db/queries/#copying-model-instances
+                    author.pk = None
+                    author.id = None
+                    author._state.adding = True
+                    author.document = doc
+                    author.save()
 
         if draft:
             draft_events = []
@@ -792,6 +803,10 @@ def post_approved_draft(url, name):
     """Post an approved draft to the RFC Editor so they can retrieve
     the data from the Datatracker and start processing it. Returns
     response and error (empty string if no error)."""
+
+    if settings.SERVER_MODE != "production":
+        log(f"In production, would have posted RFC-Editor notification of approved I-D '{name}' to '{url}'")
+        return "", ""
 
     # HTTP basic auth
     username = "dtracksync"

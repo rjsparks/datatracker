@@ -4,7 +4,6 @@
 
 import datetime
 import logging
-import io
 import os
 
 import django.db
@@ -122,7 +121,6 @@ class DocumentInfo(models.Model):
     external_url = models.URLField(blank=True)
     uploaded_filename = models.TextField(blank=True)
     note = models.TextField(blank=True)
-    internal_comments = models.TextField(blank=True)
     rfc_number = models.PositiveIntegerField(blank=True, null=True)  # only valid for type="rfc"
 
     def file_extension(self):
@@ -142,13 +140,14 @@ class DocumentInfo(models.Model):
                 if self.is_dochistory():
                     self._cached_file_path = settings.INTERNET_ALL_DRAFTS_ARCHIVE_DIR
                 else:
+                    # This could be simplified since anything in INTERNET_DRAFT_PATH is also already in INTERNET_ALL_DRAFTS_ARCHIVE_DIR
                     draft_state = self.get_state('draft')
                     if draft_state and draft_state.slug == 'active':
                         self._cached_file_path = settings.INTERNET_DRAFT_PATH
                     else:
                         self._cached_file_path = settings.INTERNET_ALL_DRAFTS_ARCHIVE_DIR
             elif self.meeting_related() and self.type_id in (
-                    "agenda", "minutes", "slides", "bluesheets", "procmaterials", "chatlog", "polls"
+                    "agenda", "minutes", "narrativeminutes", "slides", "bluesheets", "procmaterials", "chatlog", "polls"
             ):
                 meeting = self.get_related_meeting()
                 if meeting is not None:
@@ -280,6 +279,19 @@ class DocumentInfo(models.Model):
                 info = dict(doc=self)
 
             href = format.format(**info)
+
+            # For slides that are not meeting-related, we need to know the file extension.
+            # Assume we have access to the same files as settings.DOC_HREFS["slides"] and
+            # see what extension is available
+            if  self.type_id == "slides" and not self.meeting_related() and not href.endswith("/"):
+                filepath = Path(self.get_file_path()) / self.get_base_name()  # start with this
+                if not filepath.exists():
+                    # Look for other extensions - grab the first one, sorted for stability
+                    for existing in sorted(filepath.parent.glob(f"{filepath.stem}.*")):
+                        filepath = filepath.with_suffix(existing.suffix)
+                        break
+                href += filepath.suffix  # tack on the extension
+
             if href.startswith('/'):
                 href = settings.IDTRACKER_BASE_URL + href
             self._cached_href = href
@@ -425,7 +437,7 @@ class DocumentInfo(models.Model):
         return e != None and (e.text != "")
 
     def meeting_related(self):
-        if self.type_id in ("agenda","minutes","bluesheets","slides","recording","procmaterials","chatlog","polls"):
+        if self.type_id in ("agenda","minutes", "narrativeminutes", "bluesheets","slides","recording","procmaterials","chatlog","polls"):
              return self.type_id != "slides" or self.get_state_slug('reuse_policy')=='single'
         return False
 
@@ -517,22 +529,40 @@ class DocumentInfo(models.Model):
     def replaced_by(self):
         return set([ r.document for r in self.related_that("replaces") ])
 
-    def text(self):
+    def _text_path(self):
         path = self.get_file_name()
         root, ext =  os.path.splitext(path)
         txtpath = root+'.txt'
         if ext != '.txt' and os.path.exists(txtpath):
             path = txtpath
-        try:
-            with io.open(path, 'rb') as file:
-                raw = file.read()
-        except IOError:
+        return path
+    
+    def text_exists(self):
+        path = Path(self._text_path())
+        return path.exists()
+
+    def text(self, size = -1):
+        path = Path(self._text_path())
+        if not path.exists():
             return None
+        try:
+            with path.open('rb') as file:
+                raw = file.read(size)
+        except IOError as e:
+            log.log(f"Error reading text for {path}: {e}")
+            return None
+        text = None
         try:
             text = raw.decode('utf-8')
         except UnicodeDecodeError:
-            text = raw.decode('latin-1')
-        #
+            for back in range(1,4):
+                try:
+                    text = raw[:-back].decode('utf-8')
+                    break
+                except UnicodeDecodeError:
+                    pass
+            if text is None:
+                text = raw.decode('latin-1')
         return text
 
     def text_or_error(self):
@@ -1015,7 +1045,7 @@ class Document(DocumentInfo):
     def future_presentations(self):
         """ returns related SessionPresentation objects for meetings that
             have not yet ended. This implementation allows for 2 week meetings """
-        candidate_presentations = self.sessionpresentation_set.filter(
+        candidate_presentations = self.presentations.filter(
             session__meeting__date__gte=date_today() - datetime.timedelta(days=15)
         )
         return sorted(
@@ -1028,11 +1058,11 @@ class Document(DocumentInfo):
         """ returns related SessionPresentation objects for the most recent meeting in the past"""
         # Assumes no two meetings have the same start date - if the assumption is violated, one will be chosen arbitrarily
         today = date_today()
-        candidate_presentations = self.sessionpresentation_set.filter(session__meeting__date__lte=today)
+        candidate_presentations = self.presentations.filter(session__meeting__date__lte=today)
         candidate_meetings = set([p.session.meeting for p in candidate_presentations if p.session.meeting.end_date()<today])
         if candidate_meetings:
             mtg = sorted(list(candidate_meetings),key=lambda x:x.date,reverse=True)[0]
-            return self.sessionpresentation_set.filter(session__meeting=mtg)
+            return self.presentations.filter(session__meeting=mtg)
         else:
             return None
 

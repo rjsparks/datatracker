@@ -6,19 +6,21 @@ import os
 import shutil
 import io
 
+from mock import call, patch
 from pathlib import Path
 from pyquery import PyQuery
 
 import debug              # pyflakes:ignore
 
 from django.conf import settings
+from django.test import override_settings
 from django.urls import reverse as urlreverse
 from django.utils import timezone
 
 from ietf.doc.models import Document, State, NewRevisionDocEvent
 from ietf.group.factories import RoleFactory
 from ietf.group.models import Group
-from ietf.meeting.factories import MeetingFactory, SessionFactory
+from ietf.meeting.factories import MeetingFactory, SessionFactory, SessionPresentationFactory
 from ietf.meeting.models import Meeting, SessionPresentation, SchedulingEvent
 from ietf.name.models import SessionStatusName
 from ietf.person.models import Person
@@ -26,7 +28,7 @@ from ietf.utils.test_utils import TestCase, login_testing_unauthorized
 
 
 class GroupMaterialTests(TestCase):
-    settings_temp_path_overrides = TestCase.settings_temp_path_overrides + ['AGENDA_PATH']
+    settings_temp_path_overrides = TestCase.settings_temp_path_overrides + ['AGENDA_PATH', 'FTP_DIR']
     def setUp(self):
         super().setUp()
         self.materials_dir = self.tempdir("materials")
@@ -35,6 +37,10 @@ class GroupMaterialTests(TestCase):
             self.slides_dir.mkdir()
         self.saved_document_path_pattern = settings.DOCUMENT_PATH_PATTERN
         settings.DOCUMENT_PATH_PATTERN = self.materials_dir + "/{doc.type_id}/"
+        self.assertTrue(Path(settings.FTP_DIR).exists())
+        ftp_slides_dir = Path(settings.FTP_DIR) / "slides"
+        if not ftp_slides_dir.exists():
+            ftp_slides_dir.mkdir()
 
         self.meeting_slides_dir = Path(settings.AGENDA_PATH) / "42" / "slides"
         if not self.meeting_slides_dir.exists():
@@ -110,7 +116,12 @@ class GroupMaterialTests(TestCase):
         self.assertEqual(doc.title, "Test File - with fancy title")
         self.assertEqual(doc.get_state_slug(), "active")
 
-        with io.open(os.path.join(self.materials_dir, "slides", doc.name + "-" + doc.rev + ".pdf")) as f:
+        basename=f"{doc.name}-{doc.rev}.pdf"
+        filepath=Path(self.materials_dir) / "slides" / basename
+        with filepath.open() as f:
+            self.assertEqual(f.read(), content)
+        ftp_filepath=Path(settings.FTP_DIR) / "slides" / basename
+        with ftp_filepath.open() as f:
             self.assertEqual(f.read(), content)
 
         # check that posting same name is prevented
@@ -135,19 +146,47 @@ class GroupMaterialTests(TestCase):
         doc = Document.objects.get(name=doc.name)
         self.assertEqual(doc.get_state_slug(), "deleted")
 
-    def test_edit_title(self):
+    @override_settings(MEETECHO_API_CONFIG="fake settings")
+    @patch("ietf.doc.views_material.SlidesManager")
+    def test_edit_title(self, mock_slides_manager_cls):
         doc = self.create_slides()
 
         url = urlreverse('ietf.doc.views_material.edit_material', kwargs=dict(name=doc.name, action="title"))
         login_testing_unauthorized(self, "secretary", url)
+        self.assertFalse(mock_slides_manager_cls.called)
 
         # post
         r = self.client.post(url, dict(title="New title"))
         self.assertEqual(r.status_code, 302)
         doc = Document.objects.get(name=doc.name)
         self.assertEqual(doc.title, "New title")
+        self.assertFalse(mock_slides_manager_cls.return_value.send_update.called)
 
-    def test_revise(self):
+        # assign to a session to see that it now sends updates to Meetecho
+        session = SessionPresentationFactory(session__group=doc.group, document=doc).session
+
+        # Grab the title on the slides when the API call was made (to be sure it's not before it was updated)
+        titles_sent = []
+        mock_slides_manager_cls.return_value.send_update.side_effect = lambda sess: titles_sent.extend(
+            list(sess.presentations.values_list("document__title", flat=True))
+        ) 
+
+        r = self.client.post(url, dict(title="Newer title"))
+        self.assertEqual(r.status_code, 302)
+        doc = Document.objects.get(name=doc.name)
+        self.assertEqual(doc.title, "Newer title")
+        self.assertTrue(mock_slides_manager_cls.called)
+        self.assertEqual(mock_slides_manager_cls.call_args, call(api_config="fake settings"))
+        self.assertEqual(mock_slides_manager_cls.return_value.send_update.call_count, 1)
+        self.assertEqual(
+            mock_slides_manager_cls.return_value.send_update.call_args,
+            call(session),
+        )
+        self.assertEqual(titles_sent, ["Newer title"])
+
+    @override_settings(MEETECHO_API_CONFIG="fake settings")
+    @patch("ietf.doc.views_material.SlidesManager")
+    def test_revise(self, mock_slides_manager_cls):
         doc = self.create_slides()
 
         session = SessionFactory(
@@ -165,10 +204,17 @@ class GroupMaterialTests(TestCase):
 
         url = urlreverse('ietf.doc.views_material.edit_material', kwargs=dict(name=doc.name, action="revise"))
         login_testing_unauthorized(self, "secretary", url)
+        self.assertFalse(mock_slides_manager_cls.called)
 
         content = "some text"
         test_file = io.StringIO(content)
         test_file.name = "unnamed.txt"
+
+        # Grab the title on the slides when the API call was made (to be sure it's not before it was updated)
+        titles_sent = []
+        mock_slides_manager_cls.return_value.send_update.side_effect = lambda sess: titles_sent.extend(
+            list(sess.presentations.values_list("document__title", flat=True))
+        ) 
 
         # post
         r = self.client.post(url, dict(title="New title",
@@ -180,6 +226,14 @@ class GroupMaterialTests(TestCase):
         self.assertEqual(doc.rev, "02")
         self.assertEqual(doc.title, "New title")
         self.assertEqual(doc.get_state_slug(), "active")
+        self.assertTrue(mock_slides_manager_cls.called)
+        self.assertEqual(mock_slides_manager_cls.call_args, call(api_config="fake settings"))
+        self.assertEqual(mock_slides_manager_cls.return_value.send_update.call_count, 1)
+        self.assertEqual(
+            mock_slides_manager_cls.return_value.send_update.call_args,
+            call(session),
+        )
+        self.assertEqual(titles_sent, ["New title"])
 
         with io.open(os.path.join(doc.get_file_path(), doc.name + "-" + doc.rev + ".txt")) as f:
             self.assertEqual(f.read(), content)

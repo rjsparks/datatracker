@@ -1,25 +1,23 @@
 # Copyright The IETF Trust 2012-2020, All Rights Reserved
 # -*- coding: utf-8 -*-
 
-
-from django.contrib.auth.models import User
 from django.db import models
-from django.db.models import signals
 from django.urls import reverse as urlreverse
 
-from ietf.doc.models import Document, DocEvent, State
+from ietf.doc.models import Document, State
 from ietf.group.models import Group
 from ietf.person.models import Person, Email
 from ietf.utils.models import ForeignKey
 
+
 class CommunityList(models.Model):
-    user = ForeignKey(User, blank=True, null=True)
+    person = ForeignKey(Person, blank=True, null=True)
     group = ForeignKey(Group, blank=True, null=True)
     added_docs = models.ManyToManyField(Document)
 
     def long_name(self):
-        if self.user:
-            return 'Personal I-D list of %s' % self.user.username
+        if self.person:
+            return 'Personal I-D list of %s' % self.person.plain_name()
         elif self.group:
             return 'I-D list for %s' % self.group.name
         else:
@@ -30,8 +28,8 @@ class CommunityList(models.Model):
 
     def get_absolute_url(self):
         import ietf.community.views
-        if self.user:
-            return urlreverse(ietf.community.views.view_list, kwargs={ 'username': self.user.username })
+        if self.person:
+            return urlreverse(ietf.community.views.view_list, kwargs={ 'email_or_name': self.person.email() })
         elif self.group:
             return urlreverse("ietf.group.views.group_documents", kwargs={ 'acronym': self.group.acronym })
         return ""
@@ -95,20 +93,3 @@ class EmailSubscription(models.Model):
 
     def __str__(self):
         return "%s to %s (%s changes)" % (self.email, self.community_list, self.notify_on)
-
-
-def notify_events(sender, instance, **kwargs):
-    if not isinstance(instance, DocEvent):
-        return
-
-    if instance.doc.type_id != 'draft':
-        return
-
-    if getattr(instance, "skip_community_list_notification", False):
-        return
-
-    from ietf.community.utils import notify_event_to_subscribers
-    notify_event_to_subscribers(instance)
-
-
-signals.post_save.connect(notify_events)

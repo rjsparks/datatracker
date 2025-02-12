@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
     app:
         build:
@@ -103,6 +101,7 @@ services:
 #        stop_grace_period: 1m
 #        volumes:
 #            - .:/workspace
+#            - app-assets:/assets
 
 volumes:
     postgresdb-data:

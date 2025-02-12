@@ -13,23 +13,18 @@ from requests import Response
 import debug    # pyflakes:ignore
 
 from django.urls import reverse as urlreverse
-from django.utils import timezone
 
 from ietf.utils.test_utils import login_testing_unauthorized, TestCase
 import ietf.stats.views
 
-from ietf.submit.models import Submission
-from ietf.doc.factories import WgDraftFactory, WgRfcFactory
-from ietf.doc.models import Document, State, RelatedDocument, NewRevisionDocEvent, DocumentAuthor
+
 from ietf.group.factories import RoleFactory
-from ietf.meeting.factories import MeetingFactory, AttendedFactory
+from ietf.meeting.factories import MeetingFactory
 from ietf.person.factories import PersonFactory
-from ietf.person.models import Person, Email
-from ietf.name.models import FormalLanguageName, DocRelationshipName, CountryName
 from ietf.review.factories import ReviewRequestFactory, ReviewerSettingsFactory, ReviewAssignmentFactory
-from ietf.stats.models import MeetingRegistration, CountryAlias
-from ietf.stats.factories import MeetingRegistrationFactory
-from ietf.stats.utils import get_meeting_registration_data
+from ietf.stats.models import MeetingRegistration
+from ietf.stats.tasks import fetch_meeting_attendance_task
+from ietf.stats.utils import get_meeting_registration_data, FetchStats, fetch_attendance_from_meetings
 from ietf.utils.timezone import date_today
 
 
@@ -40,121 +35,14 @@ class StatisticsTests(TestCase):
         self.assertEqual(r.status_code, 200)
 
     def test_document_stats(self):
-        WgRfcFactory()
-        draft = WgDraftFactory()
-        DocumentAuthor.objects.create(
-            document=draft,
-            person=Person.objects.get(email__address="aread@example.org"),
-            email=Email.objects.get(address="aread@example.org"),
-            country="Germany",
-            affiliation="IETF",
-            order=1
-        )
+        r = self.client.get(urlreverse("ietf.stats.views.document_stats"))
+        self.assertRedirects(r, urlreverse("ietf.stats.views.stats_index"))
 
-        # create some data for the statistics
-        Submission.objects.create(
-            authors=[ { "name": "Some Body", "email": "somebody@example.com", "affiliation": "Some Inc.", "country": "US" }],
-            pages=30,
-            rev=draft.rev,
-            words=4000,
-            draft=draft,
-            file_types=".txt",
-            state_id="posted",
-        )
-
-        draft.formal_languages.add(FormalLanguageName.objects.get(slug="xml"))
-        Document.objects.filter(pk=draft.pk).update(words=4000)
-        # move it back so it shows up in the yearly summaries
-        NewRevisionDocEvent.objects.filter(doc=draft, rev=draft.rev).update(
-            time=timezone.now() - datetime.timedelta(days=500))
-
-        referencing_draft = Document.objects.create(
-            name="draft-ietf-mars-referencing",
-            type_id="draft",
-            title="Referencing",
-            stream_id="ietf",
-            abstract="Test",
-            rev="00",
-            pages=2,
-            words=100
-            )
-        referencing_draft.set_state(State.objects.get(used=True, type="draft", slug="active"))
-        RelatedDocument.objects.create(
-            source=referencing_draft,
-            target=draft,
-            relationship=DocRelationshipName.objects.get(slug="refinfo")
-        )
-        NewRevisionDocEvent.objects.create(
-            type="new_revision",
-            by=Person.objects.get(name="(System)"),
-            doc=referencing_draft,
-            desc="New revision available",
-            rev=referencing_draft.rev,
-            time=timezone.now() - datetime.timedelta(days=1000)
-        )
-
-
-        # check redirect
-        url = urlreverse(ietf.stats.views.document_stats)
-
-        authors_url = urlreverse(ietf.stats.views.document_stats, kwargs={ "stats_type": "authors" })
-
-        r = self.client.get(url)
-        self.assertEqual(r.status_code, 302)
-        self.assertTrue(authors_url in r["Location"])
-
-        # check various stats types
-        for stats_type in ["authors", "pages", "words", "format", "formlang",
-                           "author/documents", "author/affiliation", "author/country",
-                           "author/continent", "author/citations", "author/hindex",
-                           "yearly/affiliation", "yearly/country", "yearly/continent"]:
-            for document_type in ["", "rfc", "draft"]:
-                for time_choice in ["", "5y"]:
-                    url = urlreverse(ietf.stats.views.document_stats, kwargs={ "stats_type": stats_type })
-                    r = self.client.get(url, {
-                        "type": document_type,
-                        "time": time_choice,
-                    })
-                    self.assertEqual(r.status_code, 200)
-                    q = PyQuery(r.content)
-                    self.assertTrue(q('#chart'))
-                    if not stats_type.startswith("yearly"):
-                        self.assertTrue(q('table.stats-data'))
 
     def test_meeting_stats(self):
-        # create some data for the statistics
-        meeting = MeetingFactory(type_id='ietf', date=date_today(), number="96")
-        MeetingRegistrationFactory(first_name='John', last_name='Smith', country_code='US', email="john.smith@example.us", meeting=meeting, attended=True)
-        CountryAlias.objects.get_or_create(alias="US", country=CountryName.objects.get(slug="US"))
-        p = MeetingRegistrationFactory(first_name='Jaume', last_name='Guillaume', country_code='FR', email="jaume.guillaume@example.fr", meeting=meeting, attended=False).person
-        CountryAlias.objects.get_or_create(alias="FR", country=CountryName.objects.get(slug="FR"))
-        AttendedFactory(session__meeting=meeting,person=p)
-        # check redirect
-        url = urlreverse(ietf.stats.views.meeting_stats)
+        r = self.client.get(urlreverse("ietf.stats.views.meeting_stats"))
+        self.assertRedirects(r, urlreverse("ietf.stats.views.stats_index"))
 
-        authors_url = urlreverse(ietf.stats.views.meeting_stats, kwargs={ "stats_type": "overview" })
-
-        r = self.client.get(url)
-        self.assertEqual(r.status_code, 302)
-        self.assertTrue(authors_url in r["Location"])
-
-        # check various stats types
-        for stats_type in ["overview", "country", "continent"]:
-            url = urlreverse(ietf.stats.views.meeting_stats, kwargs={ "stats_type": stats_type })
-            r = self.client.get(url)
-            self.assertEqual(r.status_code, 200)
-            q = PyQuery(r.content)
-            self.assertTrue(q('#chart'))
-            if stats_type == "overview":
-                self.assertTrue(q('table.stats-data'))
-
-        for stats_type in ["country", "continent"]:
-            url = urlreverse(ietf.stats.views.meeting_stats, kwargs={ "stats_type": stats_type, "num": meeting.number })
-            r = self.client.get(url)
-            self.assertEqual(r.status_code, 200)
-            q = PyQuery(r.content)
-            self.assertTrue(q('#chart'))
-            self.assertTrue(q('table.stats-data'))
                 
     def test_known_country_list(self):
         # check redirect
@@ -300,3 +188,48 @@ class StatisticsTests(TestCase):
         get_meeting_registration_data(meeting)
         query = MeetingRegistration.objects.all()
         self.assertEqual(query.count(), 2)
+
+    @patch("ietf.stats.utils.get_meeting_registration_data")
+    def test_fetch_attendance_from_meetings(self, mock_get_mtg_reg_data):
+        mock_meetings = [object(), object(), object()]
+        mock_get_mtg_reg_data.side_effect = (
+            (1, 2, 3),
+            (4, 5, 6),
+            (7, 8, 9),
+        )
+        stats = fetch_attendance_from_meetings(mock_meetings)
+        self.assertEqual(
+            [mock_get_mtg_reg_data.call_args_list[n][0][0] for n in range(3)],
+            mock_meetings,
+        )
+        self.assertEqual(
+            stats,
+            [
+                FetchStats(1, 2, 3),
+                FetchStats(4, 5, 6),
+                FetchStats(7, 8, 9),
+            ]
+        )
+
+
+class TaskTests(TestCase):
+    @patch("ietf.stats.tasks.fetch_attendance_from_meetings")
+    def test_fetch_meeting_attendance_task(self, mock_fetch_attendance):
+        today = date_today()
+        meetings = [
+            MeetingFactory(type_id="ietf", date=today - datetime.timedelta(days=1)),
+            MeetingFactory(type_id="ietf", date=today - datetime.timedelta(days=2)),
+            MeetingFactory(type_id="ietf", date=today - datetime.timedelta(days=3)),
+        ]
+        mock_fetch_attendance.return_value = [FetchStats(1,2,3), FetchStats(1,2,3)]
+
+        fetch_meeting_attendance_task()
+        self.assertEqual(mock_fetch_attendance.call_count, 1)
+        self.assertCountEqual(mock_fetch_attendance.call_args[0][0], meetings[0:2])
+
+        # test handling of RuntimeError
+        mock_fetch_attendance.reset_mock()
+        mock_fetch_attendance.side_effect = RuntimeError
+        fetch_meeting_attendance_task()
+        self.assertTrue(mock_fetch_attendance.called)
+        # Good enough that we got here without raising an exception

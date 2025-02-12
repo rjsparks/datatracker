@@ -4,6 +4,7 @@
 
 import datetime
 import re
+from pathlib import Path
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
@@ -25,10 +26,11 @@ import debug                            # pyflakes:ignore
 from ietf.doc.models import BallotDocEvent, Document
 from ietf.doc.models import ConsensusDocEvent
 from ietf.ietfauth.utils import can_request_rfc_publication as utils_can_request_rfc_publication
-from ietf.utils.html import sanitize_fragment
 from ietf.utils import log
 from ietf.doc.utils import prettify_std_name
-from ietf.utils.text import wordwrap, fill, wrap_text_if_unwrapped, bleach_linker, bleach_cleaner, validate_url
+from ietf.utils.html import clean_html
+from ietf.utils.text import wordwrap, fill, wrap_text_if_unwrapped, linkify
+from ietf.utils.validators import validate_url
 
 register = template.Library()
 
@@ -97,7 +99,7 @@ def sanitize(value):
     attributes to those deemed acceptable.  See ietf/utils/html.py
     for the details.
     """
-    return mark_safe(sanitize_fragment(value))
+    return mark_safe(clean_html(value))
 
 
 # For use with ballot view
@@ -445,16 +447,16 @@ def ad_area(user):
 @register.filter
 def format_history_text(text, trunc_words=25):
     """Run history text through some cleaning and add ellipsis if it's too long."""
-    full = mark_safe(bleach_cleaner.clean(text))
-    full = bleach_linker.linkify(urlize_ietf_docs(full))
+    full = mark_safe(clean_html(text))
+    full = linkify(urlize_ietf_docs(full))
 
     return format_snippet(full, trunc_words)
 
 @register.filter
 def format_snippet(text, trunc_words=25): 
     # urlize if there aren't already links present
-    text = bleach_linker.linkify(text)
-    full = keep_spacing(collapsebr(linebreaksbr(mark_safe(sanitize_fragment(text)))))
+    text = linkify(text)
+    full = keep_spacing(collapsebr(linebreaksbr(mark_safe(clean_html(text)))))
     snippet = truncatewords_html(full, trunc_words)
     if snippet != full:
         return mark_safe('<div class="snippet">%s<button type="button" aria-label="Expand" class="btn btn-sm btn-primary show-all"><i class="bi bi-caret-down"></i></button></div><div class="d-none full">%s</div>' % (snippet, full))
@@ -531,11 +533,14 @@ def ics_date_time(dt, tzname):
     >>> ics_date_time(datetime.datetime(2022,1,2,3,4,5), 'UTC')
     ':20220102T030405Z'
 
+    >>> ics_date_time(datetime.datetime(2022,1,2,3,4,5), 'GmT')
+    ':20220102T030405Z'
+
     >>> ics_date_time(datetime.datetime(2022,1,2,3,4,5), 'America/Los_Angeles')
     ';TZID=America/Los_Angeles:20220102T030405'
     """
     timestamp = dt.strftime('%Y%m%dT%H%M%S')
-    if tzname.lower() == 'utc':
+    if tzname.lower() in ('gmt', 'utc'):
         return f':{timestamp}Z'
     else:
         return f';TZID={ics_esc(tzname)}:{timestamp}'
@@ -855,10 +860,10 @@ def badgeify(blob):
     Add an appropriate bootstrap badge around "text", based on its contents.
     """
     config = [
-        (r"rejected|not ready", "danger", "x-lg"),
+        (r"rejected|not ready|serious issues", "danger", "x-lg"),
         (r"complete|accepted|ready", "success", ""),
         (r"has nits|almost ready", "info", "info-lg"),
-        (r"has issues", "warning", "exclamation-lg"),
+        (r"has issues|on the right track", "warning", "exclamation-lg"),
         (r"assigned", "info", "person-plus-fill"),
         (r"will not review|overtaken by events|withdrawn", "secondary", "dash-lg"),
         (r"no response", "warning", "question-lg"),
@@ -881,3 +886,79 @@ def badgeify(blob):
             )
 
     return text
+
+@register.filter
+def simple_history_delta_changes(history):
+    """Returns diff between given history and previous entry."""
+    prev = history.prev_record
+    if prev:
+        delta = history.diff_against(prev)
+        return delta.changes
+    return []
+
+@register.filter
+def simple_history_delta_change_cnt(history):
+    """Returns number of changes between given history and previous entry."""
+    prev = history.prev_record
+    if prev:
+        delta = history.diff_against(prev)
+        return len(delta.changes)
+    return 0
+
+@register.filter
+def mtime(path):
+    """Returns a datetime object representing mtime given a pathlib Path object"""
+    return datetime.datetime.fromtimestamp(path.stat().st_mtime).astimezone(ZoneInfo(settings.TIME_ZONE))
+
+@register.filter
+def mtime_is_epoch(path):
+    return path.stat().st_mtime == 0
+
+@register.filter
+def url_for_path(path):
+    """Consructs a 'best' URL for web access to the given pathlib Path object.
+
+    Assumes that the path is into the Internet-Draft archive or the proceedings.
+    """
+    if Path(settings.AGENDA_PATH) in path.parents:
+        return (
+            f"https://www.ietf.org/proceedings/{path.relative_to(settings.AGENDA_PATH)}"
+        )
+    elif any(
+        [
+            pathdir in path.parents
+            for pathdir in [
+                Path(settings.INTERNET_DRAFT_PATH),
+                Path(settings.INTERNET_DRAFT_ARCHIVE_DIR).parent,
+                Path(settings.INTERNET_ALL_DRAFTS_ARCHIVE_DIR),
+            ]
+        ]
+    ):
+        return f"{settings.IETF_ID_ARCHIVE_URL}{path.name}"
+    else:
+        return "#"
+
+
+@register.filter
+def is_in_stream(doc):
+    """
+    Check if the doc is in one of the states in it stream that
+    indicate that is actually adopted, i.e., part of the stream.
+    (There are various "candidate" states that necessitate this
+    filter.)
+    """
+    if not doc.stream:
+        return False
+    stream = doc.stream.slug
+    state = doc.get_state_slug(f"draft-stream-{doc.stream.slug}")
+    if not state:
+        return True
+    if stream == "ietf":
+        return state not in ["wg-cand", "c-adopt"]
+    elif stream == "irtf":
+        return state != "candidat"
+    elif stream == "iab":
+        return state not in ["candidat", "diff-org"]
+    elif stream == "editorial":
+        return True
+    return False

@@ -12,8 +12,6 @@ urlpatterns = [
     url(r'^admin/$', RedirectView.as_view(url=reverse_lazy('ietf.ipr.views.admin',kwargs={'state':'pending'}), permanent=True)),
     url(r'^admin/(?P<state>pending|removed|parked)/$', views.admin),
     url(r'^ajax/search/$', views.ajax_search),
-    url(r'^by-draft/$', views.by_draft_txt),
-    url(r'^by-draft-recursive/$', views.by_draft_recursive_txt),
     url(r'^(?P<id>\d+)/$', views.show),
     url(r'^(?P<id>\d+)/addcomment/$', views.add_comment),
     url(r'^(?P<id>\d+)/addemail/$', views.add_email),
@@ -25,6 +23,6 @@ urlpatterns = [
     url(r'^(?P<id>\d+)/state/$', views.state),
     url(r'^update/$', RedirectView.as_view(url=reverse_lazy('ietf.ipr.views.showlist'), permanent=True)),
     url(r'^update/(?P<id>\d+)/$', views.update),
-    url(r'^new-(?P<type>(specific|generic|general|third-party))/$', views.new),
+    url(r'^new-(?P<_type>(specific|generic|general|third-party))/$', views.new),
     url(r'^search/$', views.search),
 ]

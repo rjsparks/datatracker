@@ -85,7 +85,7 @@ RUN gem install kramdown-rfc2629
 
 # GeckoDriver
 ARG GECKODRIVER_VERSION=latest
-RUN GK_VERSION=$(if [ ${GECKODRIVER_VERSION:-latest} = "latest" ]; then echo "0.33.0"; else echo $GECKODRIVER_VERSION; fi) \
+RUN GK_VERSION=$(if [ ${GECKODRIVER_VERSION:-latest} = "latest" ]; then echo "0.34.0"; else echo $GECKODRIVER_VERSION; fi) \
   && echo "Using GeckoDriver version: "$GK_VERSION \
   && wget --no-verbose -O /tmp/geckodriver.tar.gz https://github.com/mozilla/geckodriver/releases/download/v$GK_VERSION/geckodriver-v$GK_VERSION-linux64.tar.gz \
   && rm -rf /opt/geckodriver \
@@ -124,6 +124,15 @@ ENV LC_ALL en_US.UTF-8
 # Install idnits
 ADD https://raw.githubusercontent.com/ietf-tools/idnits-mirror/main/idnits /usr/local/bin/
 RUN chmod +rx /usr/local/bin/idnits
+
+# Install required fonts
+RUN mkdir -p /tmp/fonts && \
+    wget -q -O /tmp/fonts.tar.gz https://github.com/ietf-tools/xml2rfc-fonts/archive/refs/tags/3.22.0.tar.gz && \
+    tar zxf /tmp/fonts.tar.gz -C /tmp/fonts && \
+    mv /tmp/fonts/*/noto/* /usr/local/share/fonts/ && \
+    mv /tmp/fonts/*/roboto_mono/* /usr/local/share/fonts/ && \
+    rm -rf /tmp/fonts.tar.gz /tmp/fonts/ && \
+    fc-cache -f
 
 # Turn off rsyslog kernel logging (doesn't work in Docker)
 RUN sed -i '/imklog/s/^/#/' /etc/rsyslog.conf
