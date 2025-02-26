@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from django.conf import settings
 from django.contrib import messages
 from django.core.cache import caches
-from django.db.models import OuterRef
+from django.db.models import OuterRef, Q
 from django.forms import ValidationError
 from django.http import Http404
 from django.template.loader import render_to_string
@@ -1515,3 +1515,72 @@ def update_or_create_draft_bibxml_file(doc, rev):
 
 def ensure_draft_bibxml_path_exists():
     (Path(settings.BIBXML_BASE_PATH) / "bibxml-ids").mkdir(exist_ok=True)
+
+
+def roman_report(document_year_start, document_year_end, attended_year_start, attended_year_end):
+
+    havemet = Person.objects.filter(
+        Q(
+            meetingregistration__meeting__number__gte=100,
+            meetingregistration__meeting__date__year__in=range(attended_year_start, attended_year_end),
+            meetingregistration__meeting__date__lte=date_today(),
+            meetingregistration__reg_type="onsite" 
+        ) |
+        Q(
+            meetingregistration__meeting__number__lt=100,
+            meetingregistration__meeting__date__year__in=range(attended_year_start, attended_year_end),
+            meetingregistration__reg_type=""
+        )
+    )
+
+    not_in_person_authors = Person.objects.exclude(
+        pk__in=havemet.values_list("pk",flat=True)
+    ).filter(
+        Q(
+            documentauthor__document__docevent__newrevisiondocevent__time__year__in=range(document_year_start, document_year_end),
+            documentauthor__document__type_id="draft"
+        ) |
+        Q(
+            documentauthor__document__docevent__type="published_rfc",
+            documentauthor__document__docevent__time__year__in=range(document_year_start, document_year_end),
+            documentauthor__document__type_id="rfc"
+        ) 
+    ).distinct()
+
+    zerozero = Document.objects.filter(
+        type_id="draft",
+        docevent__newrevisiondocevent__rev="00",
+        docevent__newrevisiondocevent__time__year__in=range(document_year_start,document_year_end)
+    ).distinct()
+
+    wgzerozero = zerozero.filter(group__type_id="wg").distinct()
+
+    rfcs = Document.objects.filter(
+        type_id="rfc",
+        docevent__type="published_rfc",
+        docevent__time__year__in=range(document_year_start,document_year_end),
+        stream_id="ietf"
+    ).distinct()
+
+    print(f"Authors of draft posted or RFC published between {document_year_start} and {document_year_end} who attended no ietf meeting in person between {attended_year_start} and {attended_year_end}: {not_in_person_authors.count()}")
+    
+    d = zerozero.count()
+    n1 = zerozero.filter(documentauthor__person__in=not_in_person_authors).distinct().count()
+    n2 = zerozero.filter(documentauthor__person__in=not_in_person_authors,documentauthor__order=1).distinct().count()
+    print(f"-00 documents submitted between {document_year_start} and {document_year_end}: {d}")
+    print(f"    with one of the above authors: {n1} ({n1/d:.0%})")
+    print(f"    with one of the above authors as first author: {n2} ({n2/d:.0%})")
+    
+    d = wgzerozero.count()
+    n1 = wgzerozero.filter(documentauthor__person__in=not_in_person_authors).distinct().count()
+    n2 = wgzerozero.filter(documentauthor__person__in=not_in_person_authors,documentauthor__order=1).distinct().count() 
+    print(f"IETF wg -00 documents submitted between {document_year_start} and {document_year_end}: {d}")
+    print(f"    with one of the above authors: {n1} ({n1/d:.0%})")
+    print(f"    with one of the above authors as first author: {n2} ({n2/d:.0%})")
+
+    d = rfcs.count()
+    n1 = rfcs.filter(documentauthor__person__in=not_in_person_authors).distinct().count()
+    n2 = rfcs.filter(documentauthor__person__in=not_in_person_authors,documentauthor__order=1).distinct().count() 
+    print(f"IETF stream RFCs published between {document_year_start} and {document_year_end}: {d}")
+    print(f"    with one of the above authors: {n1} ({n1/d:.0%})")
+    print(f"    with one of the above authors as first author: {n2} ({n2/d:.0%})")
