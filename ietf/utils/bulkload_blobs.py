@@ -79,7 +79,9 @@ def bulkload_draft():
             continue
         doc_name = name[:-3]
         doc_rev = name[-3:]
-        with obj.open("rb") as file: # TODO-BLOBSTORE: plumb old ctime,mtime metadata into the write
+        with obj.open(
+            "rb"
+        ) as file:  # TODO-BLOBSTORE: plumb old ctime,mtime metadata into the write
             store_file("draft", name, file, doc_name=doc_name, doc_rev=doc_rev)
         if obj.suffix == ".txt":
             text = (

@@ -52,7 +52,7 @@ class CustomS3Storage(S3Storage):
 
     def __init__(self, **settings):
         self.in_flight_custom_metadata = {}  # type is Dict[str, Dict[str, str]]
-        self.in_flight_custom_content_type = {} # type is Dict[str, str]
+        self.in_flight_custom_content_type = {}  # type is Dict[str, str]
         super().__init__(**settings)
 
     def get_default_settings(self):
