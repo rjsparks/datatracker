@@ -113,11 +113,13 @@ class CustomS3Storage(S3Storage):
                         modified=now,
                         doc_name=doc_name,  # Note that these are assumed to be invariant
                         doc_rev=doc_rev,  # for a given name
+                        content_type=content_type,
                     ),
                 )
                 if not created:
                     record.sha384 = self.in_flight_custom_metadata[name]["sha384"]
                     record.len = int(self.in_flight_custom_metadata[name]["len"])
+                    record.content_type = content_type
                     record.modified = now
                     record.deleted = None
                     record.save()
