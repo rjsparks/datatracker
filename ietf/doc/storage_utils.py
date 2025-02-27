@@ -50,12 +50,13 @@ def store_file(
     allow_overwrite: bool = False,
     doc_name: Optional[str] = None,
     doc_rev: Optional[str] = None,
+    content_type: Optional[str] = None,
 ) -> None:
     # debug.show('f"asked to store {name} into {kind}"')
     if settings.ENABLE_BLOBSTORAGE:
         try:
             store = _get_storage(kind)
-            store.store_file(kind, name, file, allow_overwrite, doc_name, doc_rev)
+            store.store_file(kind, name, file, allow_overwrite, doc_name, doc_rev, content_type)
         except Exception as err:
             log(f"Blobstore Error: Failed to store file {kind}:{name}: {repr(err)}")
     return None

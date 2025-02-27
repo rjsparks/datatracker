@@ -52,6 +52,7 @@ class CustomS3Storage(S3Storage):
 
     def __init__(self, **settings):
         self.in_flight_custom_metadata = {}  # type is Dict[str, Dict[str, str]]
+        self.in_flight_custom_content_type = {} # type is Dict[str, str]
         super().__init__(**settings)
 
     def get_default_settings(self):
@@ -88,6 +89,7 @@ class CustomS3Storage(S3Storage):
         allow_overwrite: bool = False,
         doc_name: Optional[str] = None,
         doc_rev: Optional[str] = None,
+        content_type: Optional[str] = None,
     ):
         is_new = not self.exists_in_storage(kind, name)
         # debug.show('f"Asked to store {name} in {kind}: is_new={is_new}, allow_overwrite={allow_overwrite}"')
@@ -97,6 +99,7 @@ class CustomS3Storage(S3Storage):
             # raise Exception("Not ignoring overwrite attempts while testing")
         else:
             try:
+                self.in_flight_custom_content_type[name] = content_type
                 new_name = self.save(name, file)
                 now = timezone.now()
                 record, created = StoredObject.objects.get_or_create(
@@ -131,6 +134,7 @@ class CustomS3Storage(S3Storage):
                 debug.show('f"{complaint}: {e}"')
             finally:
                 del self.in_flight_custom_metadata[name]
+                del self.in_flight_custom_content_type[name]
         return None
 
     def exists_in_storage(self, kind: str, name: str) -> bool:
@@ -189,4 +193,6 @@ class CustomS3Storage(S3Storage):
         }
         params["Metadata"].update(metadata)
         self.in_flight_custom_metadata[name] = metadata
+        if self.in_flight_custom_content_type[name] is not None:
+            params["ContentType"] = self.in_flight_custom_content_type[name]
         return params
