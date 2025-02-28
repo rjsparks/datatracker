@@ -141,7 +141,9 @@ class CustomS3Storage(S3Storage):
                     record.deleted = None
                     record.save()
                     if old_created != record.created:
-                        log(f"Changed creation time of {kind}:{name} from {old_created} to {ctime}")
+                        log(
+                            f"Changed creation time of {kind}:{name} from {old_created} to {ctime}"
+                        )
                 if new_name != name:
                     complaint = f"Error encountered saving '{name}' - results stored in '{new_name}' instead."
                     log(complaint)
@@ -154,10 +156,10 @@ class CustomS3Storage(S3Storage):
                 log(complaint, e)
                 debug.show('f"{complaint}: {e}"')
             finally:
-                del self.in_flight_custom_metadata[name]
-                del self.in_flight_custom_content_type[name]
-                del self.in_flight_custom_ctime[name]
-                del self.in_flight_custom_mtime[name]
+                self.in_flight_custom_metadata.pop(name, None)
+                self.in_flight_custom_content_type.pop(name, None)
+                self.in_flight_custom_ctime.pop(name, None)
+                self.in_flight_custom_mtime.pop(name, None)
         return None
 
     def exists_in_storage(self, kind: str, name: str) -> bool:
