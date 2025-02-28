@@ -1,10 +1,9 @@
 # Copyright The IETF Trust 2025, All Rights Reserved
 
+import datetime
 from io import BufferedReader
 from typing import Optional, Union
 import debug  # pyflakes ignore
-
-from datetime import datetime
 
 from django.conf import settings
 from django.core.files.base import ContentFile, File
@@ -55,15 +54,23 @@ def store_file(
     doc_name: Optional[str] = None,
     doc_rev: Optional[str] = None,
     content_type: Optional[str] = None,
-    ctime: Optional[datetime] = None,
-    mtime: Optional[datetime] = None,
+    ctime: Optional[datetime.datetime] = None,
+    mtime: Optional[datetime.datetime] = None,
 ) -> None:
     # debug.show('f"asked to store {name} into {kind}"')
     if settings.ENABLE_BLOBSTORAGE:
         try:
             store = _get_storage(kind)
             store.store_file(
-                kind, name, file, allow_overwrite, doc_name, doc_rev, content_type, ctime, mtime
+                kind,
+                name,
+                file,
+                allow_overwrite,
+                doc_name,
+                doc_rev,
+                content_type,
+                ctime,
+                mtime,
             )
         except Exception as err:
             log(f"Blobstore Error: Failed to store file {kind}:{name}: {repr(err)}")

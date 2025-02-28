@@ -1,10 +1,10 @@
 # Copyright The IETF Trust 2025, All Rights Reserved
 
+import datetime
 import debug  # pyflakes:ignore
 import json
 
 from contextlib import contextmanager
-from datetime import datetime
 from hashlib import sha384
 from io import BufferedReader
 from storages.backends.s3 import S3Storage
@@ -94,8 +94,8 @@ class CustomS3Storage(S3Storage):
         doc_name: Optional[str] = None,
         doc_rev: Optional[str] = None,
         content_type: Optional[str] = None,
-        ctime: Optional[datetime] = None,
-        mtime: Optional[datetime] = None,
+        ctime: Optional[datetime.datetime] = None,
+        mtime: Optional[datetime.datetime] = None,
     ):
         is_new = not self.exists_in_storage(kind, name)
         # debug.show('f"Asked to store {name} in {kind}: is_new={is_new}, allow_overwrite={allow_overwrite}"')
@@ -117,7 +117,7 @@ class CustomS3Storage(S3Storage):
                 self.in_flight_custom_ctime[name] = ctime
                 self.in_flight_custom_mtime[name] = mtime
                 new_name = self.save(name, file)
-                record, created = StoredObject.objects.get_or_create(
+                record, object_row_created = StoredObject.objects.get_or_create(
                     store=kind,
                     name=name,
                     defaults=dict(
@@ -131,8 +131,8 @@ class CustomS3Storage(S3Storage):
                         content_type=content_type,
                     ),
                 )
-                if not created:
-                    old_created = record.created
+                if not object_row_created:
+                    old_created_time = record.created
                     record.sha384 = self.in_flight_custom_metadata[name]["sha384"]
                     record.len = int(self.in_flight_custom_metadata[name]["len"])
                     record.content_type = content_type
@@ -140,9 +140,9 @@ class CustomS3Storage(S3Storage):
                     record.modified = mtime
                     record.deleted = None
                     record.save()
-                    if old_created != record.created:
+                    if old_created_time != record.created:
                         log(
-                            f"Changed creation time of {kind}:{name} from {old_created} to {ctime}"
+                            f"Changed creation time of {kind}:{name} from {old_created_time} to {ctime}"
                         )
                 if new_name != name:
                     complaint = f"Error encountered saving '{name}' - results stored in '{new_name}' instead."
