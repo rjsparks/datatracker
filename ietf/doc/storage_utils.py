@@ -54,7 +54,6 @@ def store_file(
     doc_name: Optional[str] = None,
     doc_rev: Optional[str] = None,
     content_type: Optional[str] = None,
-    ctime: Optional[datetime.datetime] = None,
     mtime: Optional[datetime.datetime] = None,
 ) -> None:
     # debug.show('f"asked to store {name} into {kind}"')
@@ -69,7 +68,6 @@ def store_file(
                 doc_name,
                 doc_rev,
                 content_type,
-                ctime,
                 mtime,
             )
         except Exception as err:

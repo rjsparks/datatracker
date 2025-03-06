@@ -11,7 +11,6 @@ from storages.backends.s3 import S3Storage
 from typing import Optional, Union
 
 from django.core.files.base import File
-from django.core.exceptions import ObjectDoesNotExist
 
 from ietf.doc.models import StoredObject
 from ietf.utils.log import log
@@ -55,7 +54,6 @@ class CustomS3Storage(S3Storage):
     def __init__(self, **settings):
         self.in_flight_custom_metadata = {}  # type is Dict[str, Dict[str, str]]
         self.in_flight_custom_content_type = {}  # type is Dict[str, str]
-        self.in_flight_custom_ctime = {}  # type is Dict[str, str]
         self.in_flight_custom_mtime = {}  # type is Dict[str, str]
         super().__init__(**settings)
 
@@ -94,7 +92,6 @@ class CustomS3Storage(S3Storage):
         doc_name: Optional[str] = None,
         doc_rev: Optional[str] = None,
         content_type: Optional[str] = None,
-        ctime: Optional[datetime.datetime] = None,
         mtime: Optional[datetime.datetime] = None,
     ):
         is_new = not self.exists_in_storage(kind, name)
@@ -106,15 +103,9 @@ class CustomS3Storage(S3Storage):
         else:
             now = timezone.now()
             try:
-                if ctime is None:
-                    try:
-                        ctime = StoredObject.objects.get(store=kind, name=name).created
-                    except ObjectDoesNotExist:
-                        ctime = now
                 if mtime is None:
                     mtime = now
                 self.in_flight_custom_content_type[name] = content_type
-                self.in_flight_custom_ctime[name] = ctime
                 self.in_flight_custom_mtime[name] = mtime
                 new_name = self.save(name, file)
                 record, object_row_created = StoredObject.objects.get_or_create(
@@ -124,7 +115,7 @@ class CustomS3Storage(S3Storage):
                         sha384=self.in_flight_custom_metadata[name]["sha384"],
                         len=int(self.in_flight_custom_metadata[name]["len"]),
                         store_created=now,
-                        created=ctime,
+                        created=mtime,
                         modified=mtime,
                         doc_name=doc_name,  # Note that these are assumed to be invariant
                         doc_rev=doc_rev,  # for a given name
@@ -136,13 +127,13 @@ class CustomS3Storage(S3Storage):
                     record.sha384 = self.in_flight_custom_metadata[name]["sha384"]
                     record.len = int(self.in_flight_custom_metadata[name]["len"])
                     record.content_type = content_type
-                    record.created = ctime
+                    record.created = mtime
                     record.modified = mtime
                     record.deleted = None
                     record.save()
                     if old_created_time != record.created:
                         log(
-                            f"Changed creation time of {kind}:{name} from {old_created_time} to {ctime}"
+                            f"Changed creation time of {kind}:{name} from {old_created_time} to {mtime}"
                         )
                 if new_name != name:
                     complaint = f"Error encountered saving '{name}' - results stored in '{new_name}' instead."
@@ -158,7 +149,6 @@ class CustomS3Storage(S3Storage):
             finally:
                 self.in_flight_custom_metadata.pop(name, None)
                 self.in_flight_custom_content_type.pop(name, None)
-                self.in_flight_custom_ctime.pop(name, None)
                 self.in_flight_custom_mtime.pop(name, None)
         return None
 
@@ -215,7 +205,6 @@ class CustomS3Storage(S3Storage):
         metadata = {
             "len": f"{len(content_bytes)}",
             "sha384": f"{sha384(content_bytes).hexdigest()}",
-            "ctime": str(self.in_flight_custom_ctime[name]),
             "mtime": str(self.in_flight_custom_mtime[name]),
         }
         params["Metadata"].update(metadata)

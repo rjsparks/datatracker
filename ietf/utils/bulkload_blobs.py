@@ -1,5 +1,8 @@
 # Copyright The IETF Trust 2025, All Rights Reserved
 
+import debug  # pyflakes:ignore
+
+import datetime
 import io
 import rfc2html
 import xml2rfc
@@ -8,8 +11,7 @@ from pathlib import Path
 
 from django.contrib.staticfiles import finders
 
-from ietf import settings
-from ietf.doc.models import StoredObject
+from django.conf import settings
 from ietf.doc.storage_utils import exists_in_storage, store_bytes, store_file, store_str
 from ietf.utils.log import log
 
@@ -66,27 +68,41 @@ def bulkload_active_draft():
 
 def bulkload_draft():
 
-    already_exists = StoredObject.objects.filter(store="draft").values_list(
-        "name", flat=True
-    )
     path = Path(settings.INTERNET_ALL_DRAFTS_ARCHIVE_DIR)
     objs = path.glob("draft*")
     for obj in objs:
         if obj.suffix not in [".txt", ".p7s", ".xml", ".html", ".pdf", ".ps"]:
             continue
         name = f"{obj.suffix[1:]}/{obj.name}"
-        if name in already_exists:
-            continue
         doc_name = name[:-3]
         doc_rev = name[-3:]
-        with obj.open(
-            "rb"
-        ) as file:  # TODO-BLOBSTORE: plumb old ctime,mtime metadata into the write
-            store_file("draft", name, file, doc_name=doc_name, doc_rev=doc_rev)
+        stat = obj.stat()
+        mtime = datetime.datetime.fromtimestamp(stat.st_mtime, tz=datetime.timezone.utc)
+        with obj.open("rb") as file:
+            content_type = None
+            text = None
+            if obj.suffix == ".txt":
+                content_bytes = file.read()
+                try:
+                    text = content_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    # If a latin-1 decode fails (_can_ it fail?), let this raise
+                    text = content_bytes.decode("latin-1")
+                    content_type = "text/plain;charset=latin-1"
+            store_file(
+                "draft",
+                name,
+                file,
+                doc_name=doc_name,
+                doc_rev=doc_rev,
+                mtime=mtime,
+                content_type=content_type,
+                allow_overwrite=True,
+            )
+        # For now, don't try to derive things
+        continue
         if obj.suffix == ".txt":
-            text = (
-                obj.read_text()
-            )  # TODO-BLOBSTORE: I expect this to fail on non-utf8 content
+            # text will have been populated above
             htmlized = _htmlize(text)
             pdfized = _pdfize(htmlized)
             store_str(
@@ -95,6 +111,7 @@ def bulkload_draft():
                 htmlized,
                 doc_name=doc_name,
                 doc_rev=doc_rev,
+                allow_overwrite=True,
             )
             store_bytes(
                 "draft",
@@ -102,6 +119,7 @@ def bulkload_draft():
                 pdfized,
                 doc_name=doc_name,
                 doc_rev=doc_rev,
+                allow_overwrite=True
             )
         if obj.suffix == ".xml":
             _xml2pdf(obj, doc_name, doc_rev)
@@ -204,7 +222,7 @@ def _pdfize(htmlized):
     except AssertionError:
         pdf = None
     except Exception as e:
-        log.log("weasyprint failed:" + str(e))
+        log("weasyprint failed:" + str(e))
         raise
     return pdf
 
@@ -217,7 +235,7 @@ def _xml2pdf(xml_obj, doc_name, doc_rev):
         xml2rfc.log.write_out = xml2rfc_stdout
         xml2rfc.log.write_err = xml2rfc_stderr
 
-        with TemporaryDirectory as temp_dir:
+        with TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             parser = xml2rfc.XmlRfcParser(str(xml_obj), quiet=True)
             try:
@@ -277,7 +295,7 @@ def _xml2pdf(xml_obj, doc_name, doc_rev):
                     xml2rfc_stdout=xml2rfc_stdout.getvalue(),
                     xml2rfc_stderr=xml2rfc_stderr.getvalue(),
                 ) from err
-            log.log(
+            log(
                 "In %s: xml2rfc %s generated %s from %s (version %s)"
                 % (
                     str(xml_obj.parent),
@@ -288,4 +306,4 @@ def _xml2pdf(xml_obj, doc_name, doc_rev):
                 )
             )
             with Path(pdf_path).open("rb") as f:
-                store_file("draft", f"pdf/{doc_name}-{doc_rev}.pdf", f)
+                store_file("draft", f"pdf/{doc_name}-{doc_rev}.pdf", f, allow_overwrite=True)
