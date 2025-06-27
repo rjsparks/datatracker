@@ -1,10 +1,11 @@
-# Copyright The IETF Trust 2010-2021, All Rights Reserved
+# Copyright The IETF Trust 2010-2025, All Rights Reserved
 # -*- coding: utf-8 -*-
 
 
 from django.contrib import admin
 from django.db import models
 from django import forms
+from rangefilter.filters import DateRangeQuickSelectListFilterBuilder
 
 from .models import (StateType, State, RelatedDocument, DocumentAuthor, Document, RelatedDocHistory,
     DocHistoryAuthor, DocHistory, DocReminder, DocEvent, NewRevisionDocEvent,
@@ -12,7 +13,7 @@ from .models import (StateType, State, RelatedDocument, DocumentAuthor, Document
     TelechatDocEvent, BallotPositionDocEvent, ReviewRequestDocEvent, InitialReviewDocEvent,
     AddedMessageEvent, SubmissionDocEvent, DeletedEvent, EditedAuthorsDocEvent, DocumentURL,
     ReviewAssignmentDocEvent, IanaExpertDocEvent, IRSGBallotDocEvent, DocExtResource, DocumentActionHolder,
-    BofreqEditorDocEvent, BofreqResponsibleDocEvent )
+    BofreqEditorDocEvent, BofreqResponsibleDocEvent, StoredObject )
 
 from ietf.utils.validators import validate_external_resource_value
 
@@ -142,6 +143,13 @@ admin.site.register(DocumentActionHolder, DocumentActionHolderAdmin)
 
 # events
 
+class DeletedEventAdmin(admin.ModelAdmin):
+    list_display = ['id', 'content_type', 'json', 'by', 'time']
+    list_filter = ['time']
+    raw_id_fields = ['content_type', 'by']
+admin.site.register(DeletedEvent, DeletedEventAdmin)
+
+
 class DocEventAdmin(admin.ModelAdmin):
     def event_type(self, obj):
         return str(obj.type)
@@ -159,39 +167,42 @@ admin.site.register(NewRevisionDocEvent, DocEventAdmin)
 admin.site.register(StateDocEvent, DocEventAdmin)
 admin.site.register(ConsensusDocEvent, DocEventAdmin)
 admin.site.register(BallotDocEvent, DocEventAdmin)
+admin.site.register(IRSGBallotDocEvent, DocEventAdmin)
 admin.site.register(WriteupDocEvent, DocEventAdmin)
 admin.site.register(LastCallDocEvent, DocEventAdmin)
 admin.site.register(TelechatDocEvent, DocEventAdmin)
-admin.site.register(ReviewRequestDocEvent, DocEventAdmin)
-admin.site.register(ReviewAssignmentDocEvent, DocEventAdmin)
 admin.site.register(InitialReviewDocEvent, DocEventAdmin)
-admin.site.register(AddedMessageEvent, DocEventAdmin)
-admin.site.register(SubmissionDocEvent, DocEventAdmin)
 admin.site.register(EditedAuthorsDocEvent, DocEventAdmin)
 admin.site.register(IanaExpertDocEvent, DocEventAdmin)
 
-class DeletedEventAdmin(admin.ModelAdmin):
-    list_display = ['id', 'content_type', 'json', 'by', 'time']
-    list_filter = ['time']
-    raw_id_fields = ['content_type', 'by']
-admin.site.register(DeletedEvent, DeletedEventAdmin)
-
 class BallotPositionDocEventAdmin(DocEventAdmin):
-    raw_id_fields = ["doc", "by", "balloter", "ballot"]
+    raw_id_fields = DocEventAdmin.raw_id_fields + ["balloter", "ballot"]
 admin.site.register(BallotPositionDocEvent, BallotPositionDocEventAdmin)
- 
-class IRSGBallotDocEventAdmin(DocEventAdmin):
-    raw_id_fields = ["doc", "by"]
-admin.site.register(IRSGBallotDocEvent, IRSGBallotDocEventAdmin)
 
 class BofreqEditorDocEventAdmin(DocEventAdmin):
-    raw_id_fields = ["doc", "by", "editors" ]
+    raw_id_fields = DocEventAdmin.raw_id_fields + ["editors"]
 admin.site.register(BofreqEditorDocEvent, BofreqEditorDocEventAdmin)
     
 class BofreqResponsibleDocEventAdmin(DocEventAdmin):
-    raw_id_fields = ["doc", "by", "responsible" ]
+    raw_id_fields = DocEventAdmin.raw_id_fields + ["responsible"]
 admin.site.register(BofreqResponsibleDocEvent, BofreqResponsibleDocEventAdmin)
     
+class ReviewRequestDocEventAdmin(DocEventAdmin):
+    raw_id_fields = DocEventAdmin.raw_id_fields + ["review_request"]
+admin.site.register(ReviewRequestDocEvent, ReviewRequestDocEventAdmin)
+
+class ReviewAssignmentDocEventAdmin(DocEventAdmin):
+    raw_id_fields = DocEventAdmin.raw_id_fields + ["review_assignment"]
+admin.site.register(ReviewAssignmentDocEvent, ReviewAssignmentDocEventAdmin)
+
+class AddedMessageEventAdmin(DocEventAdmin):
+    raw_id_fields = DocEventAdmin.raw_id_fields + ["message"]
+admin.site.register(AddedMessageEvent, AddedMessageEventAdmin)
+
+class SubmissionDocEventAdmin(DocEventAdmin):
+    raw_id_fields = DocEventAdmin.raw_id_fields + ["submission"]
+admin.site.register(SubmissionDocEvent, SubmissionDocEventAdmin)
+
 class DocumentUrlAdmin(admin.ModelAdmin):
     list_display = ['id', 'doc', 'tag', 'url', 'desc', ]
     search_fields = ['doc__name', 'url', ]
@@ -208,3 +219,20 @@ class DocExtResourceAdmin(admin.ModelAdmin):
     search_fields = ['doc__name', 'value', 'display_name', 'name__slug',]
     raw_id_fields = ['doc', ]
 admin.site.register(DocExtResource, DocExtResourceAdmin)
+
+class StoredObjectAdmin(admin.ModelAdmin):
+    list_display = ['store', 'name', 'doc_name', 'modified', 'is_deleted']
+    list_filter = [
+        'store',
+        ('modified', DateRangeQuickSelectListFilterBuilder()),
+        ('deleted', DateRangeQuickSelectListFilterBuilder()),
+    ]
+    search_fields = ['name', 'doc_name', 'doc_rev']
+    list_display_links = ['name']
+
+    @admin.display(boolean=True, description="Deleted?", ordering="deleted")
+    def is_deleted(self, instance):
+        return instance.deleted is not None
+    
+
+admin.site.register(StoredObject, StoredObjectAdmin)

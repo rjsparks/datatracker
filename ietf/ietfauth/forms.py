@@ -3,20 +3,21 @@
 
 
 import re
+
 from unidecode import unidecode
 
 from django import forms
-from django.conf import settings
+from django.contrib.auth.models import User
+from django.contrib.auth import password_validation
 from django.core.exceptions import ValidationError
 from django.db import models
-from django.contrib.auth.models import User
-
-import debug                            # pyflakes:ignore
 
 from ietf.person.models import Person, Email
 from ietf.mailinglists.models import Allowlisted
 from ietf.utils.text import isascii
+from .password_validation import StrongPasswordValidator
 
+from .validators import prevent_at_symbol, prevent_system_name, prevent_anonymous_name, is_allowed_address
 from .widgets import PasswordStrengthInput, PasswordConfirmationInput
 
 
@@ -53,19 +54,6 @@ def ascii_cleaner(supposedly_ascii):
         raise forms.ValidationError("Only unaccented Latin characters are allowed.")
     return supposedly_ascii
 
-def prevent_at_symbol(name):
-    if "@" in name:
-        raise forms.ValidationError("Please fill in name - this looks like an email address (@ is not allowed in names).")
-
-def prevent_system_name(name):
-    name_without_spaces = name.replace(" ", "").replace("\t", "")
-    if "(system)" in name_without_spaces.lower():
-        raise forms.ValidationError("Please pick another name - this name is reserved.")
-
-def prevent_anonymous_name(name):
-    name_without_spaces = name.replace(" ", "").replace("\t", "")
-    if "anonymous" in name_without_spaces.lower():
-        raise forms.ValidationError("Please pick another name - this name is reserved.")
 
 class PersonPasswordForm(forms.ModelForm, PasswordForm):
 
@@ -156,15 +144,7 @@ def get_person_form(*args, **kwargs):
 
 
 class NewEmailForm(forms.Form):
-    new_email = forms.EmailField(label="New email address", required=False)
-
-    def clean_new_email(self):
-        email = self.cleaned_data.get("new_email", "")
-        for pat in settings.EXCLUDED_PERSONAL_EMAIL_REGEX_PATTERNS:
-            if re.search(pat, email):
-                raise ValidationError("This email address is not valid in a datatracker account")
-
-        return email
+    new_email = forms.EmailField(label="New email address", required=False, validators=[is_allowed_address])
 
 
 class RoleEmailForm(forms.Form):
@@ -193,33 +173,52 @@ class AllowlistForm(forms.ModelForm):
         model = Allowlisted
         exclude = ['by', 'time' ]
 
-    
-from django import forms
-
 
 class ChangePasswordForm(forms.Form):
     current_password = forms.CharField(widget=forms.PasswordInput)
 
-    new_password = forms.CharField(widget=PasswordStrengthInput(attrs={'class':'password_strength'}))
-    new_password_confirmation = forms.CharField(widget=PasswordConfirmationInput(
-                                                    confirm_with='new_password',
-                                                    attrs={'class':'password_confirmation'}))
+    new_password = forms.CharField(
+        widget=PasswordStrengthInput(
+            attrs={
+                "class": "password_strength",
+                "data-disable-strength-enforcement": "",  # usually removed in init
+            }
+        ),
+    )
+    new_password_confirmation = forms.CharField(
+        widget=PasswordConfirmationInput(
+            confirm_with="new_password", attrs={"class": "password_confirmation"}
+        )
+    )
 
     def __init__(self, user, data=None):
         self.user = user
-        super(ChangePasswordForm, self).__init__(data)
+        super().__init__(data)
+        # Check whether we have validators to enforce
+        new_password_field = self.fields["new_password"]
+        for pwval in password_validation.get_default_password_validators():
+            if isinstance(pwval, password_validation.MinimumLengthValidator):
+                new_password_field.widget.attrs["minlength"] = pwval.min_length
+            elif isinstance(pwval, StrongPasswordValidator):
+                new_password_field.widget.attrs.pop(
+                    "data-disable-strength-enforcement", None
+                )
 
     def clean_current_password(self):
-        password = self.cleaned_data.get('current_password', None)
+        # n.b., password = None is handled by check_password and results in a failed check
+        password = self.cleaned_data.get("current_password", None)
         if not self.user.check_password(password):
-            raise ValidationError('Invalid password')
+            raise ValidationError("Invalid password")
         return password
-            
+
     def clean(self):
-        new_password = self.cleaned_data.get('new_password', None)
-        conf_password = self.cleaned_data.get('new_password_confirmation', None)
-        if not new_password == conf_password:
-            raise ValidationError("The password confirmation is different than the new password")
+        new_password = self.cleaned_data.get("new_password", "")
+        conf_password = self.cleaned_data.get("new_password_confirmation", "")
+        if new_password != conf_password:
+            raise ValidationError(
+                "The password confirmation is different than the new password"
+            )
+        password_validation.validate_password(conf_password, self.user)
 
 
 class ChangeUsernameForm(forms.Form):

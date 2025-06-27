@@ -19,14 +19,15 @@ from django.utils.html import escape
 
 import debug                            # pyflakes:ignore
 
-from ietf.doc.expire import get_expired_drafts, send_expire_notice_for_draft, expire_draft
+from ietf.doc.expire import expirable_drafts, get_expired_drafts, send_expire_notice_for_draft, expire_draft
 from ietf.doc.factories import EditorialDraftFactory, IndividualDraftFactory, WgDraftFactory, RgDraftFactory, DocEventFactory
 from ietf.doc.models import ( Document, DocReminder, DocEvent,
     ConsensusDocEvent, LastCallDocEvent, RelatedDocument, State, TelechatDocEvent, 
     WriteupDocEvent, DocRelationshipName, IanaExpertDocEvent )
+from ietf.doc.storage_utils import exists_in_storage, store_str
 from ietf.doc.utils import get_tags_for_stream_id, create_ballot_if_not_open
 from ietf.doc.views_draft import AdoptDraftForm
-from ietf.name.models import StreamName, DocTagName
+from ietf.name.models import DocTagName, RoleName
 from ietf.group.factories import GroupFactory, RoleFactory
 from ietf.group.models import Group, Role
 from ietf.person.factories import PersonFactory, EmailFactory
@@ -471,69 +472,61 @@ class EditInfoTests(TestCase):
         self.assertIn("may not leave enough time", get_payload_text(outbox[-1]))
 
     def test_start_iesg_process_on_draft(self):
-
         draft = WgDraftFactory(
             name="draft-ietf-mars-test2",
-            group__acronym='mars',
+            group__acronym="mars",
             intended_std_level_id="ps",
-            authors=[Person.objects.get(user__username='ad')],
-            )
-        
-        url = urlreverse('ietf.doc.views_draft.edit_info', kwargs=dict(name=draft.name))
+            authors=[Person.objects.get(user__username="ad")],
+        )
+
+        url = urlreverse("ietf.doc.views_draft.edit_info", kwargs=dict(name=draft.name))
         login_testing_unauthorized(self, "secretary", url)
 
         # normal get
         r = self.client.get(url)
         self.assertEqual(r.status_code, 200)
         q = PyQuery(r.content)
-        self.assertEqual(len(q('form select[name=intended_std_level]')), 1)
-        self.assertEqual("", q('form textarea[name=notify]')[0].value.strip())
+        self.assertEqual(len(q("form select[name=intended_std_level]")), 1)
+        self.assertEqual("", q("form textarea[name=notify]")[0].value.strip())
 
-        # add
-        events_before = draft.docevent_set.count()
+        events_before = list(draft.docevent_set.values_list("id", flat=True))
         mailbox_before = len(outbox)
 
         ad = Person.objects.get(name="Areað Irector")
 
-        r = self.client.post(url,
-                             dict(intended_std_level=str(draft.intended_std_level_id),
-                                  ad=ad.pk,
-                                  create_in_state=State.objects.get(used=True, type="draft-iesg", slug="watching").pk,
-                                  notify="test@example.com",
-                                  telechat_date="",
-                                  ))
+        r = self.client.post(
+            url,
+            dict(
+                intended_std_level=str(draft.intended_std_level_id),
+                ad=ad.pk,
+                notify="test@example.com",
+                telechat_date="",
+            ),
+        )
         self.assertEqual(r.status_code, 302)
 
         draft = Document.objects.get(name=draft.name)
-        self.assertEqual(draft.get_state_slug("draft-iesg"), "watching")
+        self.assertEqual(draft.get_state_slug("draft-iesg"), "pub-req")
+        self.assertEqual(draft.get_state_slug("draft-stream-ietf"), "sub-pub")
         self.assertEqual(draft.ad, ad)
-        self.assertTrue(not draft.latest_event(TelechatDocEvent, type="scheduled_for_telechat"))
-        self.assertEqual(draft.docevent_set.count(), events_before + 4)
+        self.assertTrue(
+            not draft.latest_event(TelechatDocEvent, type="scheduled_for_telechat")
+        )
+        # check that the expected events were created (don't insist on ordering)
+        self.assertCountEqual(
+            draft.docevent_set.exclude(id__in=events_before).values_list("type", flat=True),
+            [
+                "changed_action_holders",  # action holders set to AD
+                "changed_document",  # WG state set to sub-pub
+                "changed_document",  # AD set
+                "changed_document",  # state change notice email set
+                "started_iesg_process",  # IESG state is now pub-req
+            ],
+        )
         self.assertCountEqual(draft.action_holders.all(), [draft.ad])
-        events = list(draft.docevent_set.order_by('time', 'id'))
-        self.assertEqual(events[-4].type, "started_iesg_process")
-        self.assertEqual(len(outbox), mailbox_before+1)
-        self.assertTrue('IESG processing' in outbox[-1]['Subject'])
-        self.assertTrue('draft-ietf-mars-test2@' in outbox[-1]['To']) 
-
-        # Redo, starting in publication requested to make sure WG state is also set
-        draft.set_state(State.objects.get(type_id='draft-iesg', slug='idexists'))
-        draft.set_state(State.objects.get(type='draft-stream-ietf',slug='writeupw'))
-        draft.stream = StreamName.objects.get(slug='ietf')
-        draft.action_holders.clear()
-        draft.save_with_history([DocEvent.objects.create(doc=draft, rev=draft.rev, type="changed_stream", by=Person.objects.get(user__username="secretary"), desc="Test")])
-        r = self.client.post(url,
-                             dict(intended_std_level=str(draft.intended_std_level_id),
-                                  ad=ad.pk,
-                                  create_in_state=State.objects.get(used=True, type="draft-iesg", slug="pub-req").pk,
-                                  notify="test@example.com",
-                                  telechat_date="",
-                                  ))
-        self.assertEqual(r.status_code, 302)
-        draft = Document.objects.get(name=draft.name)
-        self.assertEqual(draft.get_state_slug('draft-iesg'),'pub-req')
-        self.assertEqual(draft.get_state_slug('draft-stream-ietf'),'sub-pub')
-        self.assertCountEqual(draft.action_holders.all(), [draft.ad])
+        self.assertEqual(len(outbox), mailbox_before + 1)
+        self.assertTrue("IESG processing" in outbox[-1]["Subject"])
+        self.assertTrue("draft-ietf-mars-test2@" in outbox[-1]["To"])
 
     def test_edit_consensus(self):
         draft = WgDraftFactory()
@@ -585,6 +578,11 @@ class DraftFileMixin():
     def write_draft_file(self, name, size):
         with (Path(settings.INTERNET_DRAFT_PATH) / name).open('w') as f:
             f.write("a" * size)
+        _, ext = os.path.splitext(name)
+        if ext:
+            ext=ext[1:]
+            store_str("active-draft", f"{ext}/{name}", "a"*size, allow_overwrite=True)
+            store_str("draft", f"{ext}/{name}", "a"*size, allow_overwrite=True)
 
 
 class ResurrectTests(DraftFileMixin, TestCase):
@@ -657,6 +655,7 @@ class ResurrectTests(DraftFileMixin, TestCase):
         # ensure file restored from archive directory
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, txt)))
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, txt)))
+        self.assertTrue(exists_in_storage("active-draft",f"txt/{txt}"))
 
 
 class ExpireIDsTests(DraftFileMixin, TestCase):
@@ -750,10 +749,6 @@ class ExpireIDsTests(DraftFileMixin, TestCase):
 
         self.assertEqual(len(list(get_expired_drafts())), 1)
 
-        draft.set_state(State.objects.get(used=True, type="draft-iesg", slug="watching"))
-
-        self.assertEqual(len(list(get_expired_drafts())), 1)
-
         draft.set_state(State.objects.get(used=True, type="draft-iesg", slug="iesg-eva"))
 
         self.assertEqual(len(list(get_expired_drafts())), 0)
@@ -775,15 +770,19 @@ class ExpireIDsTests(DraftFileMixin, TestCase):
         txt = "%s-%s.txt" % (draft.name, draft.rev)
         self.write_draft_file(txt, 5000)
 
+        self.assertFalse(expirable_drafts(Document.objects.filter(pk=draft.pk)).exists())
+        draft.set_state(State.objects.get(used=True, type="draft-iesg", slug="idexists"))
+        self.assertTrue(expirable_drafts(Document.objects.filter(pk=draft.pk)).exists())
         expire_draft(draft)
 
         draft = Document.objects.get(name=draft.name)
         self.assertEqual(draft.get_state_slug(), "expired")
-        self.assertEqual(draft.get_state_slug("draft-iesg"), "dead")
+        self.assertEqual(draft.get_state_slug("draft-iesg"), "idexists")
         self.assertTrue(draft.latest_event(type="expired_document"))
-        self.assertCountEqual(draft.action_holders.all(), [])
+        self.assertEqual(draft.action_holders.count(), 0)
         self.assertIn('Removed all action holders', draft.latest_event(type='changed_action_holders').desc)
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, txt)))
+        self.assertFalse(exists_in_storage("active-draft", f"txt/{txt}"))
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, txt)))
 
         draft.delete()
@@ -807,6 +806,7 @@ class ExpireIDsTests(DraftFileMixin, TestCase):
         clean_up_draft_files()
         
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, unknown)))
+        self.assertFalse(exists_in_storage("active-draft", f"txt/{unknown}"))
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, "unknown_ids", unknown)))
 
         
@@ -817,6 +817,7 @@ class ExpireIDsTests(DraftFileMixin, TestCase):
         clean_up_draft_files()
         
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, malformed)))
+        self.assertFalse(exists_in_storage("active-draft", f"txt/{malformed}"))
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, "unknown_ids", malformed)))
 
         
@@ -831,9 +832,11 @@ class ExpireIDsTests(DraftFileMixin, TestCase):
         clean_up_draft_files()
         
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, txt)))
+        self.assertFalse(exists_in_storage("active-draft", f"txt/{txt}"))
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, txt)))
 
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, pdf)))
+        self.assertFalse(exists_in_storage("active-draft", f"pdf/{pdf}"))
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, pdf)))
 
         # expire draft
@@ -852,6 +855,7 @@ class ExpireIDsTests(DraftFileMixin, TestCase):
         clean_up_draft_files()
         
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, txt)))
+        self.assertFalse(exists_in_storage("active-draft", f"txt/{txt}"))
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, txt)))
 
 
@@ -935,6 +939,7 @@ class IndividualInfoFormsTests(TestCase):
         super().setUp()
         doc = WgDraftFactory(group__acronym='mars',shepherd=PersonFactory(user__username='plain',name='Plain Man').email_set.first())
         self.docname = doc.name
+        self.doc_group = doc.group
 
     def test_doc_change_stream(self):
         url = urlreverse('ietf.doc.views_draft.change_stream', kwargs=dict(name=self.docname))
@@ -1319,8 +1324,10 @@ class IndividualInfoFormsTests(TestCase):
         RoleFactory(name_id='techadv', person=PersonFactory(), group=doc.group)
         RoleFactory(name_id='editor', person=PersonFactory(), group=doc.group)
         RoleFactory(name_id='secr', person=PersonFactory(), group=doc.group)
-        
+        some_other_chair = RoleFactory(name_id="chair").person
+
         url = urlreverse('ietf.doc.views_doc.edit_action_holders', kwargs=dict(name=doc.name))
+        login_testing_unauthorized(self, some_other_chair.user.username, url)  # other chair can't edit action holders
         login_testing_unauthorized(self, username, url)
         
         r = self.client.get(url)
@@ -1363,6 +1370,14 @@ class IndividualInfoFormsTests(TestCase):
         _test_changing_ah(doc.authors(), 'authors can do it, too')
         _test_changing_ah([], 'clear it back out')
 
+    def test_doc_change_action_holders_as_doc_manager(self):
+        # create a test RoleName and put it in the docman_roles for the document group
+        RoleName.objects.create(slug="wrangler", name="Wrangler", used=True)
+        self.doc_group.features.docman_roles.append("wrangler")
+        self.doc_group.features.save()
+        wrangler = RoleFactory(group=self.doc_group, name_id="wrangler").person
+        self.do_doc_change_action_holders_test(wrangler.user.username)
+
     def test_doc_change_action_holders_as_secretary(self):
         self.do_doc_change_action_holders_test('secretary')
 
@@ -1372,9 +1387,11 @@ class IndividualInfoFormsTests(TestCase):
     def do_doc_remind_action_holders_test(self, username):
         doc = Document.objects.get(name=self.docname)
         doc.action_holders.set(PersonFactory.create_batch(3))
-        
+        some_other_chair = RoleFactory(name_id="chair").person
+    
         url = urlreverse('ietf.doc.views_doc.remind_action_holders', kwargs=dict(name=doc.name))
         
+        login_testing_unauthorized(self, some_other_chair.user.username, url)  # other chair can't send reminder
         login_testing_unauthorized(self, username, url)
         r = self.client.get(url)
         self.assertEqual(r.status_code, 200)
@@ -1400,6 +1417,14 @@ class IndividualInfoFormsTests(TestCase):
         doc.action_holders.clear()
         self.client.post(url)
         self.assertEqual(len(outbox), 1)  # still 1
+
+    def test_doc_remind_action_holders_as_doc_manager(self):
+        # create a test RoleName and put it in the docman_roles for the document group
+        RoleName.objects.create(slug="wrangler", name="Wrangler", used=True)
+        self.doc_group.features.docman_roles.append("wrangler")
+        self.doc_group.features.save()
+        wrangler = RoleFactory(group=self.doc_group, name_id="wrangler").person
+        self.do_doc_remind_action_holders_test(wrangler.user.username)
 
     def test_doc_remind_action_holders_as_ad(self):
         self.do_doc_remind_action_holders_test('ad')

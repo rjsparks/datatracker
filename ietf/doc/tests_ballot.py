@@ -17,22 +17,23 @@ from django.utils import timezone
 from ietf.doc.models import (Document, State, DocEvent,
                              BallotPositionDocEvent, LastCallDocEvent, WriteupDocEvent, TelechatDocEvent)
 from ietf.doc.factories import (DocumentFactory, IndividualDraftFactory, IndividualRfcFactory, WgDraftFactory,
-                                BallotPositionDocEventFactory, BallotDocEventFactory, IRSGBallotDocEventFactory)
+                                BallotPositionDocEventFactory, BallotDocEventFactory, IRSGBallotDocEventFactory, RgDraftFactory)
 from ietf.doc.templatetags.ietf_filters import can_defer
 from ietf.doc.utils import create_ballot_if_not_open
+from ietf.doc.views_ballot import parse_ballot_edit_return_point
 from ietf.doc.views_doc import document_ballot_content
 from ietf.group.models import Group, Role
 from ietf.group.factories import GroupFactory, RoleFactory, ReviewTeamFactory
 from ietf.ipr.factories import HolderIprDisclosureFactory
 from ietf.name.models import BallotPositionName
 from ietf.iesg.models import TelechatDate
-from ietf.person.models import Person, PersonalApiKey
-from ietf.person.factories import PersonFactory
+from ietf.person.models import Person
+from ietf.person.factories import PersonFactory, PersonalApiKeyFactory
 from ietf.person.utils import get_active_ads
 from ietf.utils.test_utils import TestCase, login_testing_unauthorized
 from ietf.utils.mail import outbox, empty_outbox, get_payload_text
 from ietf.utils.text import unwrap
-from ietf.utils.timezone import date_today
+from ietf.utils.timezone import date_today, datetime_today
 
 
 class EditPositionTests(TestCase):
@@ -110,7 +111,7 @@ class EditPositionTests(TestCase):
         create_ballot_if_not_open(None, draft, ad, 'approve')
         ad.user.last_login = timezone.now()
         ad.user.save()
-        apikey = PersonalApiKey.objects.create(endpoint=url, person=ad)
+        apikey = PersonalApiKeyFactory(endpoint=url, person=ad)
 
         # vote
         events_before = draft.docevent_set.count()
@@ -229,6 +230,9 @@ class EditPositionTests(TestCase):
         r = self.client.post(url, dict(position="discuss", discuss="Test discuss text"))
         self.assertEqual(r.status_code, 403)
         
+    # N.B. This test needs to be rewritten to exercise all types of ballots (iesg, irsg, rsab)
+    # and test against the output of the mailtriggers instead of looking for hardcoded values
+    # in the To and CC results. See #7864
     def test_send_ballot_comment(self):
         ad = Person.objects.get(user__username="ad")
         draft = WgDraftFactory(ad=ad,group__acronym='mars')
@@ -356,7 +360,7 @@ class BallotWriteupsTests(TestCase):
         self.assertTrue('aread@' in outbox[-1]['Cc'])
 
     def test_edit_ballot_writeup(self):
-        draft = IndividualDraftFactory(states=[('draft','active'),('draft-iesg','iesg-eva')])
+        draft = IndividualDraftFactory(states=[('draft','active'),('draft-iesg','iesg-eva')], stream_id='ietf')
         url = urlreverse('ietf.doc.views_ballot.ballot_writeupnotes', kwargs=dict(name=draft.name))
         login_testing_unauthorized(self, "secretary", url)
 
@@ -386,8 +390,25 @@ class BallotWriteupsTests(TestCase):
         self.assertTrue("This is a simple test" in d.latest_event(WriteupDocEvent, type="changed_ballot_writeup_text").text)
         self.assertTrue('iesg-eva' == d.get_state_slug('draft-iesg'))
 
+    def test_edit_ballot_writeup_unauthorized_stream(self):
+        # Test that accessing a document from unauthorized (irtf) stream returns a 404 error
+        draft = RgDraftFactory()
+        url = urlreverse('ietf.doc.views_ballot.ballot_writeupnotes', kwargs=dict(name=draft.name))
+        login_testing_unauthorized(self, "ad", url)
+
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 404)
+
+    def test_edit_ballot_writeup_invalid_name(self):
+        # Test that accessing a non-existent document returns a 404 error
+        url = urlreverse('ietf.doc.views_ballot.ballot_writeupnotes', kwargs=dict(name="invalid_name"))
+        login_testing_unauthorized(self, "ad", url)
+
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 404)
+
     def test_edit_ballot_writeup_already_approved(self):
-        draft = IndividualDraftFactory(states=[('draft','active'),('draft-iesg','approved')])
+        draft = IndividualDraftFactory(states=[('draft','active'),('draft-iesg','approved')], stream_id='ietf')
         url = urlreverse('ietf.doc.views_ballot.ballot_writeupnotes', kwargs=dict(name=draft.name))
         login_testing_unauthorized(self, "secretary", url)
 
@@ -461,7 +482,7 @@ class BallotWriteupsTests(TestCase):
     def test_issue_ballot(self):
         ad = Person.objects.get(user__username="ad")
         for case in ('none','past','future'):
-            draft = IndividualDraftFactory(ad=ad)
+            draft = IndividualDraftFactory(ad=ad, stream_id='ietf')
             if case in ('past','future'):
                 LastCallDocEvent.objects.create(
                     by=Person.objects.get(name='(System)'),
@@ -500,7 +521,7 @@ class BallotWriteupsTests(TestCase):
 
     def test_issue_ballot_auto_state_change(self):
         ad = Person.objects.get(user__username="ad")
-        draft = IndividualDraftFactory(ad=ad, states=[('draft','active'),('draft-iesg','writeupw')])
+        draft = IndividualDraftFactory(ad=ad, states=[('draft','active'),('draft-iesg','writeupw')], stream_id='ietf')
         url = urlreverse('ietf.doc.views_ballot.ballot_writeupnotes', kwargs=dict(name=draft.name))
         login_testing_unauthorized(self, "secretary", url)
 
@@ -524,17 +545,50 @@ class BallotWriteupsTests(TestCase):
 
     def test_issue_ballot_warn_if_early(self):
         ad = Person.objects.get(user__username="ad")
-        draft = IndividualDraftFactory(ad=ad, states=[('draft','active'),('draft-iesg','lc')])
+        draft = IndividualDraftFactory(ad=ad, states=[('draft','active'),('draft-iesg','lc')], stream_id='ietf')
         url = urlreverse('ietf.doc.views_ballot.ballot_writeupnotes', kwargs=dict(name=draft.name))
         login_testing_unauthorized(self, "secretary", url)
 
         # expect warning about issuing a ballot before IETF Last Call is done
+        # No last call has yet been issued
         r = self.client.get(url)
         self.assertEqual(r.status_code, 200)
         q = PyQuery(r.content)
         self.assertEqual(len(q('textarea[name=ballot_writeup]')), 1)
         self.assertTrue(q('[class=text-danger]:contains("not completed IETF Last Call")'))
         self.assertTrue(q('[type=submit]:contains("Save")'))
+
+        # Last call exists but hasn't expired
+        LastCallDocEvent.objects.create(
+            doc=draft,
+            expires=datetime_today()+datetime.timedelta(days=14),
+            by=Person.objects.get(name="(System)")
+        )
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        q = PyQuery(r.content)
+        self.assertTrue(q('[class=text-danger]:contains("not completed IETF Last Call")'))
+
+        # Last call exists and has expired
+        LastCallDocEvent.objects.filter(doc=draft).update(expires=datetime_today()-datetime.timedelta(days=2))
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        q = PyQuery(r.content)
+        self.assertFalse(q('[class=text-danger]:contains("not completed IETF Last Call")'))
+
+        for state_slug in ["lc", "ad-eval"]:
+            draft.set_state(State.objects.get(type="draft-iesg",slug=state_slug))
+            r = self.client.get(url)
+            self.assertEqual(r.status_code, 200)
+            q = PyQuery(r.content)
+            self.assertTrue(q('[class=text-danger]:contains("It would be unexpected to issue a ballot while in this state.")'))
+
+        draft.set_state(State.objects.get(type="draft-iesg",slug="writeupw"))
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        q = PyQuery(r.content)
+        self.assertFalse(q('[class=text-danger]:contains("It would be unexpected to issue a ballot while in this state.")'))         
+                         
 
     def test_edit_approval_text(self):
         ad = Person.objects.get(user__username="ad")
@@ -773,7 +827,7 @@ class ApproveBallotTests(TestCase):
         ballot = create_ballot_if_not_open(None, draft, ad, 'approve')
         old_ballot_id = ballot.id
         draft.set_state(State.objects.get(used=True, type="draft-iesg", slug="iesg-eva")) 
-        url = urlreverse('ietf.doc.views_ballot.clear_ballot', kwargs=dict(name=draft.name,ballot_type_slug=draft.ballot_open('approve').ballot_type.slug))
+        url = urlreverse('ietf.doc.views_ballot.clear_ballot', kwargs=dict(name=draft.name,ballot_type_slug="approve"))
         login_testing_unauthorized(self, "secretary", url)
         r = self.client.get(url)
         self.assertEqual(r.status_code, 200)
@@ -783,6 +837,11 @@ class ApproveBallotTests(TestCase):
         self.assertIsNotNone(ballot)
         self.assertEqual(ballot.ballotpositiondocevent_set.count(),0)
         self.assertNotEqual(old_ballot_id, ballot.id)
+        # It's not valid to clear a ballot of a type where there's no matching state
+        url = urlreverse('ietf.doc.views_ballot.clear_ballot', kwargs=dict(name=draft.name,ballot_type_slug="statchg"))
+        r = self.client.post(url,{})
+        self.assertEqual(r.status_code, 404)
+ 
 
     def test_ballot_downref_approve(self):
         ad = Person.objects.get(name="Areað Irector")
@@ -1413,3 +1472,28 @@ class BallotContentTests(TestCase):
         self._assertBallotMessage(q, balloters[0], 'No discuss send log available')
         self._assertBallotMessage(q, balloters[1], 'No comment send log available')
         self._assertBallotMessage(q, old_balloter, 'No ballot position send log available')
+
+class ReturnToUrlTests(TestCase):
+    def test_invalid_return_to_url(self):
+        with self.assertRaises(ValueError):
+            parse_ballot_edit_return_point('/', 'draft-ietf-opsawg-ipfix-tcpo-v6eh', '998718')
+
+        with self.assertRaises(ValueError):
+            parse_ballot_edit_return_point('/a-route-that-does-not-exist/', 'draft-ietf-opsawg-ipfix-tcpo-v6eh', '998718')
+
+        with self.assertRaises(ValueError):
+            parse_ballot_edit_return_point('https://example.com/phishing', 'draft-ietf-opsawg-ipfix-tcpo-v6eh', '998718')
+
+    def test_valid_default_return_to_url(self):
+        self.assertEqual(parse_ballot_edit_return_point(
+            None,
+            'draft-ietf-opsawg-ipfix-tcpo-v6eh',
+            '998718'
+        ), '/doc/draft-ietf-opsawg-ipfix-tcpo-v6eh/ballot/998718/')
+        
+    def test_valid_return_to_url(self):
+        self.assertEqual(parse_ballot_edit_return_point(
+            '/doc/draft-ietf-opsawg-ipfix-tcpo-v6eh/ballot/998718/',
+            'draft-ietf-opsawg-ipfix-tcpo-v6eh',
+            '998718'
+        ), '/doc/draft-ietf-opsawg-ipfix-tcpo-v6eh/ballot/998718/')

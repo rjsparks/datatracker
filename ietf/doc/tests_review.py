@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 
 
-import datetime, os, shutil
+from pathlib import Path
+import datetime
 import io
-import tarfile, tempfile, mailbox
-import email.mime.multipart, email.mime.text, email.utils
+import os
+import shutil
 
-from mock import patch
+from mock import patch, Mock
 from requests import Response
 
 from django.apps import apps
@@ -19,6 +20,7 @@ from pyquery import PyQuery
 
 import debug                            # pyflakes:ignore
 
+from ietf.doc.storage_utils import retrieve_str
 import ietf.review.mailarch
 
 from ietf.doc.factories import ( NewRevisionDocEventFactory, IndividualDraftFactory, WgDraftFactory,
@@ -47,6 +49,7 @@ class ReviewTests(TestCase):
         self.review_dir = self.tempdir('review')
         self.old_document_path_pattern = settings.DOCUMENT_PATH_PATTERN
         settings.DOCUMENT_PATH_PATTERN = self.review_dir + "/{doc.type_id}/"
+        (Path(settings.FTP_DIR) / "review").mkdir()
 
         self.review_subdir = os.path.join(self.review_dir, "review")
         if not os.path.exists(self.review_subdir):
@@ -56,6 +59,17 @@ class ReviewTests(TestCase):
         shutil.rmtree(self.review_dir)
         settings.DOCUMENT_PATH_PATTERN = self.old_document_path_pattern
         super().tearDown()
+
+    def verify_review_files_were_written(self, assignment, expected_content = "This is a review\nwith two lines"):
+        review_file = Path(self.review_subdir) / f"{assignment.review.name}.txt"
+        content = review_file.read_text()
+        self.assertEqual(content, expected_content)
+        self.assertEqual(
+            retrieve_str("review", review_file.name),
+            expected_content
+        )
+        review_ftp_file = Path(settings.FTP_DIR) / "review" / review_file.name
+        self.assertTrue(review_file.samefile(review_ftp_file))
 
     def test_request_review(self):
         doc = WgDraftFactory(group__acronym='mars',rev='01')
@@ -636,112 +650,132 @@ class ReviewTests(TestCase):
         assignment = reload_db_objects(assignment)
         self.assertEqual(assignment.state_id, "accepted")
 
-    def make_test_mbox_tarball(self, review_req):
-        mbox_path = os.path.join(self.review_dir, "testmbox.tar.gz")
-        with tarfile.open(mbox_path, "w:gz") as tar:
-            with tempfile.NamedTemporaryFile(dir=self.review_dir, suffix=".mbox") as tmp:
-                mbox = mailbox.mbox(tmp.name)
+    @patch('ietf.review.mailarch.requests.post')
+    def test_retrieve_messages(self, mock_post):
+        mock_data = {
+            "results": [
+                {
+                    "from": "Alice <alice@example.com>",
+                    "subject": "Hello",
+                    "content": "Hi\n This is a really good document.\n",
+                    "message_id": "abc123",
+                    "url": "https://example.com/message",
+                    "date": "2025-04-07T12:00:00",
+                }
+            ]
+        }
+        mock_post.return_value.json.return_value = mock_data
 
-                # plain text
-                msg = email.mime.text.MIMEText("Hello,\n\nI have reviewed the document and did not find any problems.\n\nJohn Doe")
-                msg["From"] = "John Doe <johndoe@example.com>"
-                msg["To"] = review_req.team.list_email
-                msg["Subject"] = "Review of {}-01".format(review_req.doc.name)
-                msg["Message-ID"] = email.utils.make_msgid()
-                msg["Archived-At"] = "<https://www.example.com/testmessage>"
-                msg["Date"] = email.utils.formatdate()
-
-                mbox.add(msg)
-
-                # plain text + HTML
-                msg = email.mime.multipart.MIMEMultipart('alternative')
-                msg["From"] = "John Doe II <johndoe2@example.com>"
-                msg["To"] = review_req.team.list_email
-                msg["Subject"] = "Review of {}".format(review_req.doc.name)
-                msg["Message-ID"] = email.utils.make_msgid()
-                msg["Archived-At"] = "<https://www.example.com/testmessage2>"
-
-                msg.attach(email.mime.text.MIMEText("Hi!,\r\nLooks OK!\r\n-John", "plain"))
-                msg.attach(email.mime.text.MIMEText("<html><body><p>Hi!,</p><p>Looks OK!</p><p>-John</p></body></html>", "html"))
-                mbox.add(msg)
-
-                tmp.flush()
-
-                tar.add(os.path.relpath(tmp.name))
-
-                mbox.close()
-
-        return mbox_path
-
-    def test_search_mail_archive(self):
-        doc = WgDraftFactory(group__acronym='mars',rev='01')
+        doc = WgDraftFactory(group__acronym='mars', rev='01')
         review_team = ReviewTeamFactory(acronym="reviewteam", name="Review Team", type_id="review", list_email="reviewteam@ietf.org", parent=Group.objects.get(acronym="farfut"))
-        rev_role = RoleFactory(group=review_team,person__user__username='reviewer',person__user__email='reviewer@example.com',name_id='reviewer')
-        RoleFactory(group=review_team,person__user__username='reviewsecretary',person__user__email='reviewsecretary@example.com',name_id='secr')
-        review_req = ReviewRequestFactory(doc=doc,team=review_team,type_id='early',state_id='assigned',requested_by=rev_role.person,deadline=timezone.now()+datetime.timedelta(days=20))
+        rev_role = RoleFactory(group=review_team, person__user__username='reviewer', person__user__email='reviewer@example.com', name_id='reviewer')
+        RoleFactory(group=review_team, person__user__username='reviewsecretary', person__user__email='reviewsecretary@example.com', name_id='secr')
+        review_req = ReviewRequestFactory(doc=doc, team=review_team, type_id='early', state_id='assigned', requested_by=rev_role.person, deadline=timezone.now() + datetime.timedelta(days=20))
+        ReviewAssignmentFactory(review_request=review_req, reviewer=rev_role.person.email_set.first(), state_id='accepted')
+
+        query_data = ietf.review.mailarch.construct_query_data(doc, review_team, query=None)
+        response = ietf.review.mailarch.retrieve_messages(query_data)
+
+        self.assertEqual(len(response), 1)
+        self.assertEqual(response[0]['from'], 'Alice <alice@example.com>')
+        self.assertEqual(response[0]['splitfrom'], ('Alice', 'alice@example.com'))
+        self.assertEqual(response[0]['subject'], 'Hello')
+        self.assertEqual(response[0]['content'], 'Hi\n This is a really good document.')
+        self.assertEqual(response[0]['message_id'], 'abc123')
+        self.assertEqual(response[0]['url'], 'https://example.com/message')
+        self.assertEqual(response[0]['utcdate'], ('2025-04-07', '12:00:00'))
+
+    def test_construct_query_data(self):
+        doc = WgDraftFactory(group__acronym='mars', rev='01')
+        review_team = ReviewTeamFactory(acronym="reviewteam", name="Review Team", type_id="review", list_email="reviewteam@ietf.org", parent=Group.objects.get(acronym="farfut"))
+        data = ietf.review.mailarch.construct_query_data(doc, review_team, query=None)
+        self.assertEqual(data['start_date'], (date_today() - datetime.timedelta(days=180)).isoformat())
+        self.assertEqual(data['email_list'], 'reviewteam')
+        self.assertEqual(data['query_value'], doc.name)
+        self.assertEqual(data['query'], f'subject:({doc.name})')
+        self.assertEqual(data['limit'], '30')
+
+    @patch('ietf.doc.views_review.requests.post')
+    def test_search_mail_archive(self, mock_post):
+        doc = WgDraftFactory(group__acronym='mars', rev='01')
+        review_team = ReviewTeamFactory(acronym="reviewteam", name="Review Team", type_id="review", list_email="reviewteam@ietf.org", parent=Group.objects.get(acronym="farfut"))
+        rev_role = RoleFactory(group=review_team, person__user__username='reviewer', person__user__email='reviewer@example.com', name_id='reviewer')
+        RoleFactory(group=review_team, person__user__username='reviewsecretary', person__user__email='reviewsecretary@example.com', name_id='secr')
+        review_req = ReviewRequestFactory(doc=doc, team=review_team, type_id='early', state_id='assigned', requested_by=rev_role.person, deadline=timezone.now() + datetime.timedelta(days=20))
         assignment = ReviewAssignmentFactory(review_request=review_req, reviewer=rev_role.person.email_set.first(), state_id='accepted')
 
+        mock_data = {
+            "results": [
+                {
+                    "from": "Alice <alice@example.com>",
+                    "subject": "Review of {}-01".format(review_req.doc.name),
+                    "content": "Hi\n This is a really good document.\n",
+                    "message_id": "abc123",
+                    "url": "https://example.com/message",
+                    "date": "2025-04-07T12:00:00",
+                },
+                {
+                    "from": "Joe <joe@example.com>",
+                    "subject": "Review of {}".format(review_req.doc.name),
+                    "content": "Hi\n I believe this is the best document.\n",
+                    "message_id": "abc456",
+                    "url": "https://example.com/message",
+                    "date": "2025-04-07T12:00:00",
+                }
+            ]
+        }
+        response1 = Mock()
+        response1.json.return_value = mock_data
+
+        response2 = Mock()
+        response2.json.return_value = mock_data
+
+        response3 = Mock()
+        response3.json.return_value = {"results": []}
+
+        mock_post.side_effect = [response1, response2, response3]
+
         # test URL construction
-        query_urls = ietf.review.mailarch.construct_query_urls(doc, review_team)
-        self.assertTrue(review_req.doc.name in query_urls["query_data_url"])
+        query_data = ietf.review.mailarch.construct_query_data(doc, review_team)
+        self.assertTrue(review_req.doc.name in query_data["query_value"])
 
-        # test parsing
-        mbox_path = self.make_test_mbox_tarball(review_req)
+        url = urlreverse('ietf.doc.views_review.search_mail_archive', kwargs={"name": doc.name, "assignment_id": assignment.pk})
+        url2 = urlreverse('ietf.doc.views_review.search_mail_archive', kwargs={"name": doc.name, "acronym": review_team.acronym})
+        login_testing_unauthorized(self, "reviewsecretary", url)
 
-        try:
-            # mock URL generator and point it to local file - for this
-            # to work, the module (and not the function) must be
-            # imported in the view
-            real_fn = ietf.review.mailarch.construct_query_urls
-            ietf.review.mailarch.construct_query_urls = lambda doc, team, query=None: { "query_data_url": "file://" + os.path.abspath(mbox_path) }
-            url = urlreverse('ietf.doc.views_review.search_mail_archive', kwargs={ "name": doc.name, "assignment_id": assignment.pk })
-            url2 = urlreverse('ietf.doc.views_review.search_mail_archive', kwargs={ "name": doc.name, "acronym": review_team.acronym })
-            login_testing_unauthorized(self, "reviewsecretary", url)
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        messages = r.json()["messages"]
+        self.assertEqual(len(messages), 2)
 
-            r = self.client.get(url)
-            self.assertEqual(r.status_code, 200)
-            messages = r.json()["messages"]
-            self.assertEqual(len(messages), 2)
+        r = self.client.get(url2)
+        self.assertEqual(r.status_code, 200)
+        messages = r.json()["messages"]
+        self.assertEqual(len(messages), 2)
 
-            r = self.client.get(url2)
-            self.assertEqual(r.status_code, 200)
-            messages = r.json()["messages"]
-            self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0]["url"], "https://example.com/message")
+        self.assertTrue("Hi" in messages[0]["content"])
+        self.assertEqual(messages[0]["subject"], "Review of {}-01".format(review_req.doc.name))
+        self.assertEqual(messages[0]["revision_guess"], "01")
+        self.assertEqual(messages[0]["splitfrom"], ["Alice", "alice@example.com"])
+        self.assertEqual(messages[0]["utcdate"], ['2025-04-07', '12:00:00'])
 
-            today = date_today(datetime.timezone.utc)
+        self.assertEqual(messages[1]["url"], "https://example.com/message")
+        self.assertTrue("Hi" in messages[1]["content"])
+        self.assertTrue("<html>" not in messages[1]["content"])
+        self.assertEqual(messages[1]["subject"], "Review of {}".format(review_req.doc.name))
+        self.assertFalse('revision_guess' in messages[1])
+        self.assertEqual(messages[1]["splitfrom"], ["Joe", "joe@example.com"])
+        self.assertEqual(messages[1]["utcdate"], ['2025-04-07', '12:00:00'])
 
-            self.assertEqual(messages[0]["url"], "https://www.example.com/testmessage")
-            self.assertTrue("John Doe" in messages[0]["content"])
-            self.assertEqual(messages[0]["subject"], "Review of {}-01".format(review_req.doc.name))
-            self.assertEqual(messages[0]["revision_guess"], "01")
-            self.assertEqual(messages[0]["splitfrom"], ["John Doe", "johndoe@example.com"])
-            self.assertEqual(messages[0]["utcdate"][0], today.isoformat())
+        # Test failure to return mailarch results
+        url = urlreverse('ietf.doc.views_review.search_mail_archive', kwargs={"name": doc.name, "assignment_id": assignment.pk})
 
-            self.assertEqual(messages[1]["url"], "https://www.example.com/testmessage2")
-            self.assertTrue("Looks OK" in messages[1]["content"])
-            self.assertTrue("<html>" not in messages[1]["content"])
-            self.assertEqual(messages[1]["subject"], "Review of {}".format(review_req.doc.name))
-            self.assertFalse('revision_guess' in messages[1])
-            self.assertEqual(messages[1]["splitfrom"], ["John Doe II", "johndoe2@example.com"])
-            self.assertEqual(messages[1]["utcdate"][0], "")
-
-
-            # Test failure to return mailarch results
-            no_result_path = os.path.join(self.review_dir, "mailarch_no_result.html")
-            with io.open(no_result_path, "w") as f:
-                f.write('Content-Type: text/html\n\n<html><body><div class="xtr"><div class="xtd no-results">No results found</div></div>')
-            ietf.review.mailarch.construct_query_urls = lambda doc, team, query=None: { "query_data_url": "file://" + os.path.abspath(no_result_path) }
-
-            url = urlreverse('ietf.doc.views_review.search_mail_archive', kwargs={ "name": doc.name, "assignment_id": assignment.pk })
-
-            r = self.client.get(url)
-            self.assertEqual(r.status_code, 200)
-            result = r.json()
-            self.assertNotIn('messages', result)
-            self.assertIn('No results found', result['error'])
-
-        finally:
-            ietf.review.mailarch.construct_query_urls = real_fn
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        result = r.json()
+        self.assertNotIn('messages', result)
+        self.assertIn('No results found', result['error'])
 
     def test_submit_unsolicited_review_choose_team(self):
         doc = WgDraftFactory(group__acronym='mars', rev='01')
@@ -830,8 +864,7 @@ class ReviewTests(TestCase):
         self.assertTrue(assignment.review_request.team.acronym.lower() in assignment.review.name)
         self.assertTrue(assignment.review_request.doc.rev in assignment.review.name)
 
-        with io.open(os.path.join(self.review_subdir, assignment.review.name + ".txt")) as f:
-            self.assertEqual(f.read(), "This is a review\nwith two lines")
+        self.verify_review_files_were_written(assignment)
 
         self.assertEqual(len(outbox), 1)
         self.assertIn(assignment.review_request.team.list_email, outbox[0]["To"])
@@ -885,12 +918,14 @@ class ReviewTests(TestCase):
         completed_time_diff = timezone.now() - assignment.completed_on
         self.assertLess(completed_time_diff, datetime.timedelta(seconds=10))
 
-        with io.open(os.path.join(self.review_subdir, assignment.review.name + ".txt")) as f:
-            self.assertEqual(f.read(), "This is a review\nwith two lines")
+        self.verify_review_files_were_written(assignment)
 
         self.assertEqual(len(outbox), 1)
         self.assertIn(assignment.review_request.team.list_email, outbox[0]["To"])
-        self.assertIn("This is a review", get_payload_text(outbox[0]))
+        payload = get_payload_text(outbox[0])
+        self.assertIn("This is a review", payload)
+        self.assertIn(f"Document: {assignment.review_request.doc.name}", payload)
+        self.assertIn(f"Title: {assignment.review_request.doc.title}", payload)
 
         self.assertIn(settings.MAILING_LIST_ARCHIVE_URL, assignment.review.external_url)
 
@@ -926,8 +961,7 @@ class ReviewTests(TestCase):
         self.assertLess(event0_time_diff, datetime.timedelta(seconds=10))
         self.assertEqual(events[1].time, datetime.datetime(2012, 12, 24, 12, 13, 14, tzinfo=DEADLINE_TZINFO))
         
-        with io.open(os.path.join(self.review_subdir, assignment.review.name + ".txt")) as f:
-            self.assertEqual(f.read(), "This is a review\nwith two lines")
+        self.verify_review_files_were_written(assignment)
 
         self.assertEqual(len(outbox), 1)
         self.assertIn(assignment.review_request.team.list_email, outbox[0]["To"])
@@ -1013,8 +1047,7 @@ class ReviewTests(TestCase):
         assignment = reload_db_objects(assignment)
         self.assertEqual(assignment.state_id, "completed")
 
-        with io.open(os.path.join(self.review_subdir, assignment.review.name + ".txt")) as f:
-            self.assertEqual(f.read(), "This is a review\nwith two lines")
+        self.verify_review_files_were_written(assignment)
 
         self.assertEqual(len(outbox), 0)
         self.assertTrue("http://example.com" in assignment.review.external_url)
@@ -1063,8 +1096,7 @@ class ReviewTests(TestCase):
         self.assertEqual(assignment.reviewer, rev_role.person.role_email('reviewer'))
         self.assertEqual(assignment.state_id, "completed")
 
-        with io.open(os.path.join(self.review_subdir, assignment.review.name + ".txt")) as f:
-            self.assertEqual(f.read(), "This is a review\nwith two lines")
+        self.verify_review_files_were_written(assignment)
 
         self.assertEqual(len(outbox), 0)
         self.assertTrue("http://example.com" in assignment.review.external_url)
@@ -1172,8 +1204,9 @@ class ReviewTests(TestCase):
         self.assertLess(event_time_diff, datetime.timedelta(seconds=10))
         self.assertTrue('revised' in event1.desc.lower())
 
-        with io.open(os.path.join(self.review_subdir, assignment.review.name + ".txt")) as f:
-            self.assertEqual(f.read(), "This is a review\nwith two lines")
+        # See https://github.com/ietf-tools/datatracker/issues/6941
+        # These are _not_ getting written as a new version as intended.
+        self.verify_review_files_were_written(assignment)
 
         self.assertEqual(len(outbox), 0)
 
@@ -1199,6 +1232,8 @@ class ReviewTests(TestCase):
         self.assertLess(event_time_diff, datetime.timedelta(seconds=10))
         # Ensure that a new event was created for the new revision (#2590)
         self.assertNotEqual(event1.id, event2.id)
+
+        self.verify_review_files_were_written(assignment, "This is a revised review")
 
         self.assertEqual(len(outbox), 0)
         

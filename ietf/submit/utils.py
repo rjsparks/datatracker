@@ -4,9 +4,12 @@
 
 import datetime
 import io
+import json
 import os
 import pathlib
 import re
+import subprocess
+import sys
 import time
 import traceback
 import xml2rfc
@@ -15,6 +18,8 @@ from pathlib import Path
 from shutil import move
 from typing import Optional, Union  # pyflakes:ignore
 from unidecode import unidecode
+from xml2rfc import RfcWriterError
+from xym import xym
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -31,6 +36,7 @@ from ietf.doc.models import ( Document, State, DocEvent, SubmissionDocEvent,
     DocumentAuthor, AddedMessageEvent )
 from ietf.doc.models import NewRevisionDocEvent
 from ietf.doc.models import RelatedDocument, DocRelationshipName, DocExtResource
+from ietf.doc.storage_utils import remove_from_storage, retrieve_bytes, store_bytes, store_file, store_str
 from ietf.doc.utils import (add_state_change_event, rebuild_reference_relations,
     set_replaces_for_document, prettify_std_name, update_doc_extresources, 
     can_edit_docextresources, update_documentauthors, update_action_holders,
@@ -43,6 +49,7 @@ from ietf.person.models import Person, Email
 from ietf.community.utils import update_name_contains_indexes_with_new_doc
 from ietf.submit.mail import ( announce_to_lists, announce_new_version, announce_to_authors,
     send_approval_request, send_submission_confirmation, announce_new_wg_00, send_manual_post_request )
+from ietf.submit.checkers import DraftYangChecker
 from ietf.submit.models import ( Submission, SubmissionEvent, Preapproval, DraftSubmissionStateName,
     SubmissionCheck, SubmissionExtResource )
 from ietf.utils import log
@@ -51,7 +58,7 @@ from ietf.utils.draft import PlaintextDraft
 from ietf.utils.mail import is_valid_email
 from ietf.utils.text import parse_unicode, normalize_text
 from ietf.utils.timezone import date_today
-from ietf.utils.xmldraft import XMLDraft
+from ietf.utils.xmldraft import InvalidMetadataError, XMLDraft, capture_xml2rfc_output
 from ietf.person.name import unidecode_name
 
 
@@ -167,7 +174,10 @@ def validate_submission_rev(name, rev):
 
         if rev != expected:
             return 'Invalid revision (revision %02d is expected)' % expected
-
+        
+        # This is not really correct, though the edges that it doesn't cover are not likely.
+        # It might be better just to look in the combined archive to make sure we're not colliding with
+        # a thing that exists there already because it was included from an approved personal collection.
         for dirname in [settings.INTERNET_DRAFT_PATH, settings.INTERNET_DRAFT_ARCHIVE_DIR, ]:
             dir = pathlib.Path(dirname)
             pattern = '%s-%02d.*' % (name, rev)
@@ -446,6 +456,7 @@ def post_submission(request, submission, approved_doc_desc, approved_subm_desc):
         from ietf.doc.expire import move_draft_files_to_archive
         move_draft_files_to_archive(draft, prev_rev)
 
+    submission.draft = draft
     move_files_to_repository(submission)
     submission.state = DraftSubmissionStateName.objects.get(slug="posted")
     log.log(f"{submission.name}: moved files")
@@ -479,7 +490,6 @@ def post_submission(request, submission, approved_doc_desc, approved_subm_desc):
     if new_possibly_replaces:
         send_review_possibly_replaces_request(request, draft, submitter_info)
 
-    submission.draft = draft
     submission.save()
 
     create_submission_event(request, submission, approved_subm_desc)
@@ -489,6 +499,7 @@ def post_submission(request, submission, approved_doc_desc, approved_subm_desc):
     ref_rev_file_name = os.path.join(os.path.join(settings.BIBXML_BASE_PATH, 'bibxml-ids'), 'reference.I-D.%s-%s.xml' % (draft.name, draft.rev ))
     with io.open(ref_rev_file_name, "w", encoding='utf-8') as f:
         f.write(ref_text)
+    store_str("bibxml-ids", f"reference.I-D.{draft.name}-{draft.rev}.txt", ref_text) # TODO-BLOBSTORE verify with test
 
     log.log(f"{submission.name}: done")
     
@@ -637,6 +648,7 @@ def cancel_submission(submission):
 
 
 def rename_submission_files(submission, prev_rev, new_rev):
+    log.unreachable("2025-2-19")
     for ext in settings.IDSUBMIT_FILE_TYPES:
         staging_path = Path(settings.IDSUBMIT_STAGING_PATH) 
         source = staging_path / f"{submission.name}-{prev_rev}.{ext}"
@@ -652,26 +664,33 @@ def move_files_to_repository(submission):
         dest = Path(settings.IDSUBMIT_REPOSITORY_PATH) / fname
         if source.exists():
             move(source, dest)
+            all_archive_dest = Path(settings.INTERNET_ALL_DRAFTS_ARCHIVE_DIR) / dest.name
+            ftp_dest = Path(settings.FTP_DIR) / "internet-drafts" / dest.name
+            os.link(dest, all_archive_dest)
+            os.link(dest, ftp_dest)
+            # Shadow what's happening to the fs in the blobstores. When the stores become
+            # authoritative, the source and dest checks will need to apply to the stores instead.
+            content_bytes = retrieve_bytes("staging", fname)
+            store_bytes("active-draft", f"{ext}/{fname}", content_bytes)
+            submission.draft.store_bytes(f"{ext}/{fname}", content_bytes)
+            remove_from_storage("staging", fname)
         elif dest.exists():
             log.log("Intended to move '%s' to '%s', but found source missing while destination exists.")
-        elif ext in submission.file_types.split(','):
+        elif f".{ext}" in submission.file_types.split(','):
             raise ValueError("Intended to move '%s' to '%s', but found source and destination missing.")
 
 
-def remove_staging_files(name, rev, exts=None):
-    """Remove staging files corresponding to a submission
-    
-    exts is a list of extensions to be removed. If None, defaults to settings.IDSUBMIT_FILE_TYPES.
-    """
-    if exts is None:
-        exts = [f'.{ext}' for ext in settings.IDSUBMIT_FILE_TYPES]
+def remove_staging_files(name, rev):
+    """Remove staging files corresponding to a submission"""
     basename = pathlib.Path(settings.IDSUBMIT_STAGING_PATH) / f'{name}-{rev}' 
+    exts = [f'.{ext}' for ext in settings.IDSUBMIT_FILE_TYPES]
     for ext in exts:
         basename.with_suffix(ext).unlink(missing_ok=True)
+        remove_from_storage("staging", basename.with_suffix(ext).name, warn_if_missing=False)
 
 
 def remove_submission_files(submission):
-    remove_staging_files(submission.name, submission.rev, submission.file_types.split(','))
+    remove_staging_files(submission.name, submission.rev)
 
 
 def approvable_submissions_for_user(user):
@@ -756,71 +775,9 @@ def save_files(form):
             for chunk in f.chunks():
                 destination.write(chunk)
         log.log("saved file %s" % name)
+        f.seek(0)
+        store_file("staging", f"{form.filename}-{form.revision}.{ext}", f)
     return file_name
-
-def get_draft_meta(form, saved_files):
-    authors = []
-    file_name = saved_files
-
-    if form.cleaned_data['xml']:
-        # Some meta-information, such as the page-count, can only
-        # be retrieved from the generated text file.  Provide a
-        # parsed draft object to get at that kind of information.
-        file_name['txt'] = os.path.join(settings.IDSUBMIT_STAGING_PATH, '%s-%s.txt' % (form.filename, form.revision))
-        file_size = os.stat(file_name['txt']).st_size
-        with io.open(file_name['txt']) as txt_file:
-            form.parsed_draft = PlaintextDraft(txt_file.read(), txt_file.name)
-    else:
-        file_size = form.cleaned_data['txt'].size
-
-    if form.authors:
-        authors = form.authors
-    else:
-        # If we don't have an xml file, try to extract the
-        # relevant information from the text file
-        for author in form.parsed_draft.get_author_list():
-            full_name, first_name, middle_initial, last_name, name_suffix, email, country, company = author
-
-            name = full_name.replace("\n", "").replace("\r", "").replace("<", "").replace(">", "").strip()
-
-            if email:
-                try:
-                    validate_email(email)
-                except ValidationError:
-                    email = ""
-
-            def turn_into_unicode(s):
-                if s is None:
-                    return ""
-
-                if isinstance(s, str):
-                    return s
-                else:
-                    try:
-                        return s.decode("utf-8")
-                    except UnicodeDecodeError:
-                        try:
-                            return s.decode("latin-1")
-                        except UnicodeDecodeError:
-                            return ""
-
-            name = turn_into_unicode(name)
-            email = turn_into_unicode(email)
-            company = turn_into_unicode(company)
-
-            authors.append({
-                "name": name,
-                "email": email,
-                "affiliation": company,
-                "country": country
-            })
-
-    if form.abstract:
-        abstract = form.abstract
-    else:
-        abstract = form.parsed_draft.get_abstract()
-
-    return authors, abstract, file_name, file_size
 
 
 def get_submission(form):
@@ -907,8 +864,51 @@ def accept_submission_requires_group_approval(submission):
 
 
 class SubmissionError(Exception):
-    """Exception for errors during submission processing"""
-    pass
+    """Exception for errors during submission processing
+    
+    Sanitizes paths appearing in exception messages.
+    """
+    def __init__(self, *args):
+        if len(args) > 0:
+            args = (self.sanitize_message(arg) for arg in args)
+        super().__init__(*args)
+
+    @staticmethod
+    def sanitize_message(msg):
+        # Paths likely to appear in submission-related errors
+        paths = [
+            p for p in (
+                getattr(settings, "ALL_ID_DOWNLOAD_DIR", None),
+                getattr(settings, "BIBXML_BASE_PATH", None),
+                getattr(settings, "DERIVED_DIR", None),
+                getattr(settings, "FTP_DIR", None),
+                getattr(settings, "IDSUBMIT_REPOSITORY_PATH", None),
+                getattr(settings, "IDSUBMIT_STAGING_PATH", None),
+                getattr(settings, "INTERNET_ALL_DRAFTS_ARCHIVE_DIR", None),
+                getattr(settings, "INTERNET_DRAFT_PATH", None),
+                getattr(settings, "INTERNET_DRAFT_ARCHIVE_DIR", None),
+                getattr(settings, "INTERNET_DRAFT_PDF_PATH", None),
+                getattr(settings, "RFC_PATH", None),
+                getattr(settings, "SUBMIT_YANG_CATALOG_MODEL_DIR", None),
+                getattr(settings, "SUBMIT_YANG_DRAFT_MODEL_DIR", None),
+                getattr(settings, "SUBMIT_YANG_IANA_MODEL_DIR", None),
+                getattr(settings, "SUBMIT_YANG_RFC_MODEL_DIR", None),
+                "/tmp/",
+            ) if p is not None
+        ]
+        return re.sub(fr"({'|'.join(paths)})/*", "**/", msg)
+
+
+class XmlRfcError(SubmissionError):
+    """SubmissionError caused by xml2rfc
+    
+    Includes the output from xml2rfc, if any, in xml2rfc_stdout / xml2rfc_stderr
+    """
+    def __init__(self, *args, xml2rfc_stdout: str, xml2rfc_stderr: str):
+        super().__init__(*args)
+        self.xml2rfc_stderr = xml2rfc_stderr
+        self.xml2rfc_stdout = xml2rfc_stdout
+
 
 class InconsistentRevisionError(SubmissionError):
     """SubmissionError caused by an inconsistent revision"""
@@ -926,59 +926,103 @@ def render_missing_formats(submission):
     If a txt file already exists, leaves it in place. Overwrites an existing html file
     if there is one.
     """
-    xml2rfc.log.write_out = io.StringIO()   # open(os.devnull, "w")
-    xml2rfc.log.write_err = io.StringIO()   # open(os.devnull, "w")
-    xml_path = staging_path(submission.name, submission.rev, '.xml')
-    parser = xml2rfc.XmlRfcParser(str(xml_path), quiet=True)
-    # --- Parse the xml ---
-    xmltree = parser.parse(remove_comments=False)
-    # If we have v2, run it through v2v3. Keep track of the submitted version, though.
-    xmlroot = xmltree.getroot()
-    xml_version = xmlroot.get('version', '2')
-    if xml_version == '2':
-        v2v3 = xml2rfc.V2v3XmlWriter(xmltree)
-        xmltree.tree = v2v3.convert2to3()
-
-    # --- Prep the xml ---
-    today = date_today()
-    prep = xml2rfc.PrepToolWriter(xmltree, quiet=True, liberal=True, keep_pis=[xml2rfc.V3_PI_TARGET])
-    prep.options.accept_prepped = True
-    prep.options.date = today
-    xmltree.tree = prep.prep()
-    if xmltree.tree == None:
-        raise SubmissionError(f'Error from xml2rfc (prep): {prep.errors}')
-
-    # --- Convert to txt ---
-    txt_path = staging_path(submission.name, submission.rev, '.txt')
-    if not txt_path.exists():
-        writer = xml2rfc.TextWriter(xmltree, quiet=True)
-        writer.options.accept_prepped = True
+    with capture_xml2rfc_output() as xml2rfc_logs:
+        xml_path = staging_path(submission.name, submission.rev, '.xml')
+        parser = xml2rfc.XmlRfcParser(str(xml_path), quiet=True)
+        try:
+            # --- Parse the xml ---
+            xmltree = parser.parse(remove_comments=False)
+        except Exception as err:
+            raise XmlRfcError(
+                "Error parsing XML",
+                xml2rfc_stdout=xml2rfc_logs["stdout"].getvalue(),
+                xml2rfc_stderr=xml2rfc_logs["stderr"].getvalue(),
+            ) from err
+        # If we have v2, run it through v2v3. Keep track of the submitted version, though.
+        xmlroot = xmltree.getroot()
+        xml_version = xmlroot.get('version', '2')
+        if xml_version == '2':
+            v2v3 = xml2rfc.V2v3XmlWriter(xmltree)
+            try:
+                xmltree.tree = v2v3.convert2to3()
+            except Exception as err:
+                raise XmlRfcError(
+                    "Error converting v2 XML to v3",
+                    xml2rfc_stdout=xml2rfc_logs["stdout"].getvalue(),
+                    xml2rfc_stderr=xml2rfc_logs["stderr"].getvalue(),
+                ) from err
+    
+        # --- Prep the xml ---
+        today = date_today()
+        prep = xml2rfc.PrepToolWriter(xmltree, quiet=True, liberal=True, keep_pis=[xml2rfc.V3_PI_TARGET])
+        prep.options.accept_prepped = True
+        prep.options.date = today
+        try:
+            xmltree.tree = prep.prep()
+        except RfcWriterError:
+            raise XmlRfcError(
+                f"Error during xml2rfc prep: {prep.errors}",
+                xml2rfc_stdout=xml2rfc_logs["stdout"].getvalue(),
+                xml2rfc_stderr=xml2rfc_logs["stderr"].getvalue(),
+            )
+        except Exception as err:
+            raise XmlRfcError(
+                "Unexpected error during xml2rfc prep",
+                xml2rfc_stdout=xml2rfc_logs["stdout"].getvalue(),
+                xml2rfc_stderr=xml2rfc_logs["stderr"].getvalue(),
+            ) from err
+    
+        # --- Convert to txt ---
+        txt_path = staging_path(submission.name, submission.rev, '.txt')
+        if not txt_path.exists():
+            writer = xml2rfc.TextWriter(xmltree, quiet=True)
+            writer.options.accept_prepped = True
+            writer.options.date = today
+            try:
+                writer.write(txt_path)
+            except Exception as err:
+                raise XmlRfcError(
+                    "Error generating text format from XML",
+                    xml2rfc_stdout=xml2rfc_logs["stdout"].getvalue(),
+                    xml2rfc_stderr=xml2rfc_logs["stderr"].getvalue(),
+                ) from err
+            log.log(
+                'In %s: xml2rfc %s generated %s from %s (version %s)' % (
+                    str(xml_path.parent),
+                    xml2rfc.__version__,
+                    txt_path.name,
+                    xml_path.name,
+                    xml_version,
+                )
+            )
+            # When the blobstores become autoritative - the guard at the
+            # containing if statement needs to be based on the store
+            with Path(txt_path).open("rb") as f:
+                store_file("staging", f"{submission.name}-{submission.rev}.txt", f)
+    
+        # --- Convert to html ---
+        html_path = staging_path(submission.name, submission.rev, '.html')
+        writer = xml2rfc.HtmlWriter(xmltree, quiet=True)
         writer.options.date = today
-        writer.write(txt_path)
+        try:
+            writer.write(str(html_path))
+        except Exception as err:
+            raise XmlRfcError(
+                "Error generating HTML format from XML",
+                xml2rfc_stdout=xml2rfc_logs["stdout"].getvalue(),
+                xml2rfc_stderr=xml2rfc_logs["stderr"].getvalue(),
+            ) from err
         log.log(
             'In %s: xml2rfc %s generated %s from %s (version %s)' % (
                 str(xml_path.parent),
                 xml2rfc.__version__,
-                txt_path.name,
+                html_path.name,
                 xml_path.name,
                 xml_version,
             )
         )
-
-    # --- Convert to html ---
-    html_path = staging_path(submission.name, submission.rev, '.html')
-    writer = xml2rfc.HtmlWriter(xmltree, quiet=True)
-    writer.options.date = today
-    writer.write(str(html_path))
-    log.log(
-        'In %s: xml2rfc %s generated %s from %s (version %s)' % (
-            str(xml_path.parent),
-            xml2rfc.__version__,
-            html_path.name,
-            xml_path.name,
-            xml_version,
-        )
-    )
+    with Path(html_path).open("rb") as f:
+        store_file("staging", f"{submission.name}-{submission.rev}.html", f)
 
 
 def accept_submission(submission: Submission, request: Optional[HttpRequest] = None, autopost=False):
@@ -1153,6 +1197,11 @@ def process_submission_xml(filename, revision):
     if not title:
         raise SubmissionError("Could not extract a valid title from the XML")
     
+    try:
+        document_date = xml_draft.get_creation_date()
+    except InvalidMetadataError as err:
+        raise SubmissionError(str(err)) from err
+
     return {
         "filename": xml_draft.filename,
         "rev": xml_draft.revision,
@@ -1162,7 +1211,7 @@ def process_submission_xml(filename, revision):
             for auth in xml_draft.get_author_list()
         ],
         "abstract": None,  # not supported from XML
-        "document_date": xml_draft.get_creation_date(),
+        "document_date": document_date,
         "pages": None,  # not supported from XML
         "words": None,  # not supported from XML
         "first_two_pages": None,  # not supported from XML
@@ -1175,8 +1224,7 @@ def process_submission_xml(filename, revision):
 def _turn_into_unicode(s: Optional[Union[str, bytes]]):
     """Decode a possibly null string-like item as a string
     
-    Copied from ietf.submit.utils.get_draft_meta(), would be nice to
-    ditch this.
+    Would be nice to ditch this.
     """
     if s is None:
         return ""
@@ -1220,7 +1268,7 @@ def process_submission_text(filename, revision):
     if title:
         title = _normalize_title(title)
 
-    # Drops \r, \n, <, >. Based on get_draft_meta() behavior
+    # Translation taable drops \r, \n, <, >.
     trans_table = str.maketrans("", "", "\r\n<>")
     authors = [
         {
@@ -1252,7 +1300,7 @@ def process_submission_text(filename, revision):
 def process_and_validate_submission(submission):
     """Process and validate a submission
 
-    Raises SubmissionError if an error is encountered.
+    Raises SubmissionError or a subclass if an error is encountered.
     """
     if len(set(submission.file_types.split(",")).intersection({".xml", ".txt"})) == 0:
         raise SubmissionError("Require XML and/or text format to process an Internet-Draft submission.")
@@ -1262,7 +1310,16 @@ def process_and_validate_submission(submission):
         # Parse XML first, if we have it
         if ".xml" in submission.file_types:
             xml_metadata = process_submission_xml(submission.name, submission.rev)
-            render_missing_formats(submission)  # makes HTML and text, unless text was uploaded
+            try:
+                render_missing_formats(submission)  # makes HTML and text, unless text was uploaded
+            except XmlRfcError as err:
+                # log stdio/stderr
+                log.log(
+                    f"xml2rfc failure when rendering missing formats for {submission.name}-{submission.rev}:\n"
+                    f">> stdout:\n{err.xml2rfc_stdout}\n"
+                    f">> stderr:\n{err.xml2rfc_stderr}"
+                )
+                raise
         # Parse text, whether uploaded or generated from XML
         text_metadata = process_submission_text(submission.name, submission.rev)
 
@@ -1321,11 +1378,12 @@ def process_and_validate_submission(submission):
             raise SubmissionError('Checks failed: ' + ' / '.join(errors))
     except SubmissionError:
         raise  # pass SubmissionErrors up the stack
-    except Exception:
+    except Exception as err:
+        # (this is a good point to just `raise err` when diagnosing Submission test failures)
         # convert other exceptions into SubmissionErrors
         log.log(f'Unexpected exception while processing submission {submission.pk}.')
         log.log(traceback.format_exc())
-        raise SubmissionError('A system error occurred while processing the submission.')
+        raise SubmissionError('A system error occurred while processing the submission.') from err
 
 
 def submitter_is_author(submission):
@@ -1417,6 +1475,7 @@ def process_uploaded_submission(submission):
         create_submission_event(None, submission, desc="Uploaded submission (diverted to manual process)")
         send_manual_post_request(None, submission, errors=dict(consistency=str(consistency_error)))
     except SubmissionError as err:
+        # something generic went wrong
         submission.refresh_from_db()  # guard against incomplete changes in submission validation / processing
         cancel_submission(submission)  # changes Submission.state
         create_submission_event(None, submission, f"Submission rejected: {err}")
@@ -1424,3 +1483,138 @@ def process_uploaded_submission(submission):
         submission.state_id = "uploaded"
         submission.save()
         create_submission_event(None, submission, desc="Completed submission validation checks")
+
+
+def apply_yang_checker_to_draft(checker, draft):
+    submission = Submission.objects.filter(name=draft.name, rev=draft.rev).order_by('-id').first()
+    if submission:
+        check = submission.checks.filter(checker=checker.name).order_by('-id').first()
+        if check:
+            result = checker.check_file_txt(draft.get_file_name())
+            passed, message, errors, warnings, items = result
+            items = json.loads(json.dumps(items))
+            new_res = (passed, errors, warnings, message)
+            old_res = (check.passed, check.errors, check.warnings, check.message) if check else ()
+            if new_res != old_res:
+                log.log(f"Saving new yang checker results for {draft.name}-{draft.rev}")
+                qs = submission.checks.filter(checker=checker.name).order_by('time')
+                submission.checks.filter(checker=checker.name).exclude(pk=qs.first().pk).delete()
+                submission.checks.create(submission=submission, checker=checker.name, passed=passed,
+                                         message=message, errors=errors, warnings=warnings, items=items,
+                                         symbol=checker.symbol)
+    else:
+        log.log(f"Could not run yang checker for {draft.name}-{draft.rev}: missing submission object")
+
+
+def run_all_yang_model_checks():
+    checker = DraftYangChecker()
+    for draft in Document.objects.filter(
+        type_id="draft",
+        states=State.objects.get(type="draft", slug="active"),
+    ):
+        apply_yang_checker_to_draft(checker, draft)
+
+
+def populate_yang_model_dirs():
+    """Update the yang model dirs
+
+     * All yang modules from published RFCs should be extracted and be
+       available in an rfc-yang repository.
+
+     * All valid yang modules from active, not replaced, Internet-Drafts
+       should be extracted and be available in a draft-valid-yang repository.
+
+     * All, valid and invalid, yang modules from active, not replaced,
+       Internet-Drafts should be available in a draft-all-yang repository.
+       (Actually, given precedence ordering, it would be enough to place
+       non-validating modules in a draft-invalid-yang repository instead).
+
+     * In all cases, example modules should be excluded.
+
+     * Precedence is established by the search order of the repository as
+       provided to pyang.
+
+     * As drafts expire, models should be removed in order to catch cases
+       where a module being worked on depends on one which has slipped out
+       of the work queue.
+
+    """
+    def extract_from(file, dir, strict=True):
+        saved_stdout = sys.stdout
+        saved_stderr = sys.stderr
+        xymerr = io.StringIO()
+        xymout = io.StringIO()
+        sys.stderr = xymerr
+        sys.stdout = xymout
+        model_list = []
+        try:
+            model_list = xym.xym(str(file), str(file.parent), str(dir), strict=strict, debug_level=-2)
+            for name in model_list:
+                modfile = moddir / name
+                mtime = file.stat().st_mtime
+                os.utime(str(modfile), (mtime, mtime))
+                if '"' in name:
+                    name = name.replace('"', '')
+                    modfile.rename(str(moddir / name))
+            model_list = [n.replace('"', '') for n in model_list]
+        except Exception as e:
+            log.log("Error when extracting from %s: %s" % (file, str(e)))
+        finally:
+            sys.stdout = saved_stdout
+            sys.stderr = saved_stderr
+        return model_list
+
+    # Extract from new RFCs
+
+    rfcdir = Path(settings.RFC_PATH)
+
+    moddir = Path(settings.SUBMIT_YANG_RFC_MODEL_DIR)
+    if not moddir.exists():
+        moddir.mkdir(parents=True)
+
+    latest = 0
+    for item in moddir.iterdir():
+        if item.stat().st_mtime > latest:
+            latest = item.stat().st_mtime
+
+    log.log(f"Extracting RFC Yang models to {moddir} ...")
+    for item in rfcdir.iterdir():
+        if item.is_file() and item.name.startswith('rfc') and item.name.endswith('.txt') and item.name[3:-4].isdigit():
+            if item.stat().st_mtime > latest:
+                model_list = extract_from(item, moddir)
+                for name in model_list:
+                    if not (name.startswith('ietf') or name.startswith('iana')):
+                        modfile = moddir / name
+                        modfile.unlink()
+
+    # Extract valid modules from drafts
+
+    six_months_ago = time.time() - 6 * 31 * 24 * 60 * 60
+
+    def active(dirent):
+        return dirent.stat().st_mtime > six_months_ago
+
+    draftdir = Path(settings.INTERNET_DRAFT_PATH)
+    moddir = Path(settings.SUBMIT_YANG_DRAFT_MODEL_DIR)
+    if not moddir.exists():
+        moddir.mkdir(parents=True)
+    log.log(f"Emptying {moddir} ...")
+    for item in moddir.iterdir():
+        item.unlink()
+
+    log.log(f"Extracting draft Yang models to {moddir} ...")
+    for item in draftdir.iterdir():
+        try:
+            if item.is_file() and item.name.startswith('draft') and item.name.endswith('.txt') and active(item):
+                model_list = extract_from(item, moddir, strict=False)
+                for name in model_list:
+                    if name.startswith('example'):
+                        modfile = moddir / name
+                        modfile.unlink()
+        except UnicodeDecodeError as e:
+            log.log(f"Error processing {item.name}: {e}")
+
+    ftp_moddir = Path(settings.FTP_DIR) / "yang" / "draftmod/"
+    if not moddir.endswith("/"):
+        moddir += "/"
+    subprocess.call(("/usr/bin/rsync", "-aq", "--delete", moddir, ftp_moddir))

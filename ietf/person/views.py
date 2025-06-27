@@ -62,8 +62,9 @@ def ajax_select2_search(request, model_name):
         page = int(request.GET.get("p", 1)) - 1
     except ValueError:
         page = 0
-
-    objs = objs.distinct()[page:page + 10]
+    PAGE_SIZE = 10
+    first_item = page * PAGE_SIZE
+    objs = objs.distinct()[first_item:first_item + PAGE_SIZE]
 
     return HttpResponse(select2_id_name_json(objs), content_type='application/json')
 
@@ -76,7 +77,7 @@ def profile(request, email_or_name):
 def photo(request, email_or_name):
     persons = lookup_persons(email_or_name)
     if len(persons) > 1:
-        return HttpResponse(r"\r\n".join([p.user.username for p in persons]), status=300)
+        raise Http404("No photo found")
     person = persons[0]
     if not person.photo:
         raise Http404("No photo found")

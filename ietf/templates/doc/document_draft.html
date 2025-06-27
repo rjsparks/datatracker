@@ -27,6 +27,7 @@
     {% origin %}
     {{ top|safe }}
     {% include "doc/revisions_list.html"  with document_html=document_html %}
+    {% include "doc/disclaimer.html" with document_html=document_html %}
     <div id="doc-timeline"></div>
     {% if doc.rev != latest_rev %}
         <div class="alert alert-warning my-3">The information below is for an old version of the document.</div>
@@ -303,7 +304,7 @@
                             Action Holder{{ doc.documentactionholder_set.all|pluralize }}
                         </th>
                         <td class="edit">
-                            {% if can_edit %}
+                            {% if can_edit_action_holders %}
                                 <a class="btn btn-primary btn-sm"
                                    href="{% url 'ietf.doc.views_doc.edit_action_holders' name=doc.name %}">
                                     Edit
@@ -318,7 +319,7 @@
                                             {% person_link action_holder.person title=action_holder.role_for_doc %} {{ action_holder|action_holder_badge }}
                                         </div>
                                     {% endfor %}
-                                    {% if can_edit %}
+                                    {% if can_edit_action_holders %}
                                         <a class="btn btn-primary btn-sm mt-3"
                                            href="{% url "ietf.doc.views_doc.remind_action_holders" name=doc.name %}">
                                             <i class="bi bi-envelope">

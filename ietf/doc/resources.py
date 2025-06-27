@@ -18,7 +18,7 @@ from ietf.doc.models import (BallotType, DeletedEvent, StateType, State, Documen
     RelatedDocHistory, BallotPositionDocEvent, AddedMessageEvent, SubmissionDocEvent,
     ReviewRequestDocEvent, ReviewAssignmentDocEvent, EditedAuthorsDocEvent, DocumentURL,
     IanaExpertDocEvent, IRSGBallotDocEvent, DocExtResource, DocumentActionHolder, 
-    BofreqEditorDocEvent,BofreqResponsibleDocEvent)
+    BofreqEditorDocEvent, BofreqResponsibleDocEvent, StoredObject)
 
 from ietf.name.resources import BallotPositionNameResource, DocTypeNameResource
 class BallotTypeResource(ModelResource):
@@ -130,7 +130,6 @@ class DocumentResource(ModelResource):
             "external_url": ALL,
             "uploaded_filename": ALL,
             "note": ALL,
-            "internal_comments": ALL,
             "name": ALL,
             "type": ALL_WITH_RELATIONS,
             "stream": ALL_WITH_RELATIONS,
@@ -247,7 +246,6 @@ class DocHistoryResource(ModelResource):
             "external_url": ALL,
             "uploaded_filename": ALL,
             "note": ALL,
-            "internal_comments": ALL,
             "name": ALL,
             "type": ALL_WITH_RELATIONS,
             "stream": ALL_WITH_RELATIONS,
@@ -844,3 +842,26 @@ class BofreqResponsibleDocEventResource(ModelResource):
             "responsible": ALL_WITH_RELATIONS,
         }
 api.doc.register(BofreqResponsibleDocEventResource())
+
+
+class StoredObjectResource(ModelResource):
+    class Meta:
+        queryset = StoredObject.objects.all()
+        serializer = api.Serializer()
+        cache = SimpleCache()
+        #resource_name = 'storedobject'
+        ordering = ['id', ]
+        filtering = { 
+            "id": ALL,
+            "store": ALL,
+            "name": ALL,
+            "sha384": ALL,
+            "len": ALL,
+            "store_created": ALL,
+            "created": ALL,
+            "modified": ALL,
+            "doc_name": ALL,
+            "doc_rev": ALL,
+            "deleted": ALL,
+        }
+api.doc.register(StoredObjectResource())

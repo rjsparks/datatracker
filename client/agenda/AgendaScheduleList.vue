@@ -15,6 +15,7 @@
           td(:colspan='pickerModeActive ? 6 : 5')
             i.bi.bi-exclamation-triangle.me-2
             span(v-if='agendaStore.searchVisible && agendaStore.searchText') No event matching your search query.
+            span(v-else-if='agendaStore.meeting.prelimAgendaDate') A preliminary agenda is expected to be released on {{ agendaStore.meeting.prelimAgendaDate }}
             span(v-else) Nothing to display
         tr(
           v-for='item of meetingEvents'
@@ -24,7 +25,7 @@
           )
           //- ROW - DAY HEADING -----------------------
           template(v-if='item.displayType === `day`')
-            td(:id='`agenda-day-` + item.id', :colspan='pickerModeActive ? 6 : 5') {{item.date}}
+            td(:id='item.slug', :colspan='pickerModeActive ? 6 : 5') {{item.date}}
           //- ROW - SESSION HEADING -------------------
           template(v-else-if='item.displayType === `session-head`')
             td.agenda-table-cell-check(v-if='pickerModeActive') &nbsp;
@@ -83,6 +84,14 @@
                 template(#trigger)
                   span.badge.is-bof BoF
                 span #[a(href='https://www.ietf.org/how/bofs/', target='_blank') Birds of a Feather] sessions (BoFs) are initial discussions about a particular topic of interest to the IETF community.
+              n-popover(
+                v-if='item.isProposed'
+                trigger='hover'
+                :width='250'
+                )
+                template(#trigger)
+                  span.badge.is-proposed Proposed
+                span #[a(href='https://www.ietf.org/process/wgs/', target='_blank') Proposed WGs] are groups in the process of being chartered. If the charter is not approved by the IESG before the IETF meeting, the session may be canceled.
               .agenda-table-note(v-if='item.note')
                 i.bi.bi-arrow-return-right.me-1
                 span {{item.note}}
@@ -112,20 +121,12 @@
                     :options='item.links'
                     key-field='id'
                     :render-icon='renderLinkIcon'
-                    :render-label='renderLinkLabel'
+                    :render-label='renderLink'
                     )
                     n-button(size='tiny')
                       i.bi.bi-three-dots
                 .agenda-table-cell-links-buttons(v-else-if='item.links && item.links.length > 0')
-                    template(v-if='item.flags.agenda')
-                      n-popover
-                        template(#trigger)
-                          i.bi.bi-collection(
-                            :id='`btn-lnk-` + item.key + `-mat`'
-                            @click='showMaterials(item.key)'
-                            )
-                        span Show meeting materials
-                    template(v-else-if='item.type === `regular`')
+                    template(v-if='!item.flags.agenda && item.type === `regular`')
                       n-popover
                         template(#trigger)
                           i.no-meeting-materials
@@ -134,7 +135,16 @@
                         span No meeting materials yet.
                     n-popover(v-for='lnk of item.links', :key='lnk.id')
                       template(#trigger)
+                        button(
+                          v-if="lnk.click"
+                          type="button"
+                          :id='`btn-` + lnk.id'
+                          @click='lnk.click'
+                          :aria-label='lnk.label'
+                          :class='`border-0 bg-transparent text-` + lnk.color'
+                          ): i.bi(:class='`bi-` + lnk.icon')
                         a(
+                          v-else
                           :id='`btn-` + lnk.id'
                           :href='lnk.href'
                           :aria-label='lnk.label'
@@ -200,7 +210,7 @@ import {
 
 import AgendaDetailsModal from './AgendaDetailsModal.vue'
 
-import { useAgendaStore } from './store'
+import { useAgendaStore, daySlugPrefix, daySlug } from './store'
 import { useSiteStore } from '../shared/store'
 import { getUrl } from '../shared/urls'
 
@@ -245,20 +255,23 @@ const meetingEvents = computed(() => {
 
     // -> Add date row
     const itemDate = DateTime.fromISO(item.adjustedStartDate)
+    let willRenderDateRow = false
     if (itemDate.toISODate() !== acc.lastDate) {
       acc.result.push({
         id: item.id,
+        slug: daySlug(item),
         key: `day-${itemDate.toISODate()}`,
         displayType: 'day',
         date: itemDate.toLocaleString(DateTime.DATE_HUGE),
         cssClasses: 'agenda-table-display-day'
       })
+      willRenderDateRow = true
     }
     acc.lastDate = itemDate.toISODate()
 
     // -> Add session header row
     const typeName = `${item.type}-${item.slotName}`
-    if (item.type === 'regular' && acc.lastTypeName !== typeName) {
+    if (item.type === 'regular' && (acc.lastTypeName !== typeName || willRenderDateRow)) {
       acc.result.push({
         key: `sesshd-${item.id}`,
         displayType: 'session-head',
@@ -269,12 +282,28 @@ const meetingEvents = computed(() => {
     }
     acc.lastTypeName = typeName
 
-    // -> Populate event links
+    // 
+    /**
+     * -> Populate event menu items
+     * 
+     * links is an array of either,
+     * 1. { href: "...",        click: undefined, ...sharedProps }
+     * 2. { click: () => {...}, href: undefined,  ...sharedProps }
+     */
     const links = []
     const typesWithLinks = ['regular', 'plenary', 'other']
     const purposesWithoutLinks = ['admin', 'closed_meeting', 'officehours', 'social']
     if (item.flags.showAgenda || (typesWithLinks.includes(item.type) && !purposesWithoutLinks.includes(item.purpose))) {
       if (item.flags.agenda) {
+        // -> Meeting Materials
+        links.push({
+          id: `btn-${item.id}-mat`,
+          label: 'Show meeting materials',
+          icon: 'collection',
+          href: undefined,
+          click: () => showMaterials(item.id),
+          color: 'black'
+        })
         links.push({
           id: `lnk-${item.id}-tar`,
           label: 'Download meeting materials as .tar archive',
@@ -296,7 +325,18 @@ const meetingEvents = computed(() => {
           color: 'red'
         })
       }
-      if (agendaStore.useNotes) {
+      // -> Point to Wiki for Hackathon sessions, HedgeDocs otherwise
+      if (item.groupAcronym === 'hackathon') {
+        links.push({
+          id: `lnk-${item.id}-wiki`,
+          label: 'Wiki',
+          icon: 'book',
+          href: getUrl('hackathonWiki', {
+            meetingNumber: agendaStore.meeting.number
+          }),
+          color: 'blue'
+        })
+      } else if (agendaStore.usesNotes) {
         links.push({
           id: `lnk-${item.id}-note`,
           label: 'Notepad for note-takers',
@@ -424,6 +464,23 @@ const meetingEvents = computed(() => {
               color: 'purple'
             })
           }
+          // -> Keep showing video client / on-site tool for Plenary until end of day, in case it goes over the planned time range
+          if (item.type === 'plenary' && item.adjustedEnd.day === current.day) {
+            links.push({
+              id: `lnk-${item.id}-video`,
+              label: 'Full Client with Video',
+              icon: 'camera-video',
+              href: item.links.videoStream,
+              color: 'purple'
+            })
+            links.push({
+              id: `lnk-${item.id}-onsitetool`,
+              label: 'Onsite tool',
+              icon: 'telephone-outbound',
+              href: item.links.onsiteTool,
+              color: 'teal'
+            })
+          }
         }
       }
     }
@@ -440,7 +497,7 @@ const meetingEvents = computed(() => {
       case 'other':
         if (item.name.toLowerCase().indexOf('office hours') >= 0) {
           icon = 'bi-building'
-        } else if (item.name.toLowerCase().indexOf('hackathon') >= 0) {
+        } else if (item.groupAcronym === 'hackathon') {
           icon = 'bi-command bi-pink'
         }
         break
@@ -467,6 +524,7 @@ const meetingEvents = computed(() => {
       // groupParentName: item.groupParent?.name,
       icon,
       isBoF: item.isBoF,
+      isProposed: item.isProposed,
       isSessionEvent: item.type === 'regular',
       links,
       location: item.location,
@@ -560,20 +618,52 @@ function renderLinkIcon (opt) {
   return h('i', { class: `bi bi-${opt.icon} text-${opt.color}` })
 }
 
-function renderLinkLabel (opt) {
+function renderLink (opt) {
+  if (opt.click) {
+    return h('button', { type: 'button', class: 'overflow-button', onClick: opt.click }, opt.label)
+  }
+
   return h('a', { href: opt.href, target: '_blank' }, opt.label)
 }
 
 function recalculateRedLine () {
   state.currentMinute = DateTime.local().minute
-  const lastEventId = agendaStore.findCurrentEventId()
+  const currentEventId = agendaStore.findCurrentEventId()
 
-  if (lastEventId) {
-    state.redhandOffset = document.getElementById(`agenda-rowid-${lastEventId}`)?.offsetTop || 0
+  if (currentEventId) {
+    state.redhandOffset = document.getElementById(`agenda-rowid-${currentEventId}`)?.offsetTop || 0
   } else {
     state.redhandOffset = 0
   }
 }
+
+/**
+ * On page load when browser location hash contains '#now' or '#agenda-day-*' then scroll accordingly
+ */
+;(function scrollToHashInit() {
+  if (!window.location.hash) {
+    return
+  }
+  if (!(window.location.hash === "#now" || window.location.hash.startsWith(`#${daySlugPrefix}`))) {
+    return
+  }
+  const unsubscribe = agendaStore.$subscribe((_mutation, agendaStoreState) => {
+    if (agendaStoreState.schedule.length === 0) {
+      return
+    }
+    unsubscribe() // we only need to scroll once, so unsubscribe from future updates
+    if (window.location.hash === "#now") {
+      const nowEventId = agendaStore.findNowEvent()
+      if (nowEventId) {
+        document.getElementById(`agenda-rowid-${nowEventId}`)?.scrollIntoView(true)
+      } else {
+        message.warning('There is no event happening right now or in the future.')
+      }
+    } else if(window.location.hash.startsWith(`#${daySlugPrefix}`)) {
+      document.getElementById(window.location.hash.substring(1))?.scrollIntoView(true)
+    }
+  })
+})()
 
 // MOUNTED
 
@@ -987,13 +1077,26 @@ onBeforeUnmount(() => {
         word-wrap: break-word;
       }
 
-      .badge.is-bof {
-        background-color: $teal-500;
+      .badge {
         margin: 0 8px;
 
+        &.is-bof {
+          background-color: $teal-500;
+
+          @at-root .theme-dark & {
+            background-color: $teal-700;
+          }
+        }
+
+        &.is-proposed {
+          background-color: $gray-500;
+
+          @at-root .theme-dark & {
+            background-color: $gray-700;
+          }
+        }
+
         @media screen and (max-width: $bs5-break-md) {
-          width: 30px;
-          display: block;
           margin: 2px 0 0 0;
         }
       }
@@ -1216,6 +1319,11 @@ onBeforeUnmount(() => {
 
     &.agenda-table-cell-room {
       border-right: 1px solid darken($red-100, 5%) !important;
+      text-decoration: line-through;
+    }
+
+    &.agenda-table-cell-name > a, &.agenda-table-cell-name > span {
+      text-decoration: line-through;
     }
 
     &:last-child {
@@ -1243,6 +1351,11 @@ onBeforeUnmount(() => {
 
     &.agenda-table-cell-room {
       border-right: 1px solid darken($orange-100, 5%) !important;
+      text-decoration: line-through;
+    }
+
+    &.agenda-table-cell-name > a, &.agenda-table-cell-name > span {
+      text-decoration: line-through;
     }
 
     &:last-child {
@@ -1493,6 +1606,22 @@ onBeforeUnmount(() => {
         animation-delay: #{(5 - $i) * .05}s;
       }
     }
+  }
+}
+
+.overflow-button {
+  font-size: inherit;
+  padding: 0;
+  border: 0;
+  background: transparent;
+
+  &:before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    bottom: 0;
   }
 }
 

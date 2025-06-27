@@ -32,6 +32,7 @@ from ietf.doc.mails import ( email_pulled_from_rfc_queue, email_resurrect_reques
     generate_publication_request, email_adopted, email_intended_status_changed,
     email_iesg_processing_document, email_ad_approved_doc,
     email_iana_expert_review_state_changed )
+from ietf.doc.storage_utils import retrieve_bytes, store_bytes
 from ietf.doc.utils import ( add_state_change_event, can_adopt_draft, can_unadopt_draft,
     get_tags_for_stream_id, nice_consensus, update_action_holders,
     update_reminder, update_telechat, make_notify_changed_event, get_initial_notify,
@@ -52,6 +53,7 @@ from ietf.person.models import Person, Email
 from ietf.utils.mail import send_mail, send_mail_message, on_behalf_of
 from ietf.utils.textupload import get_cleaned_text_file_content
 from ietf.utils import log
+from ietf.utils.fields import ModelMultipleChoiceField
 from ietf.utils.response import permission_denied
 from ietf.utils.timezone import datetime_today, DEADLINE_TZINFO
 
@@ -94,7 +96,8 @@ def change_state(request, name):
     and logging the change as a comment."""
     doc = get_object_or_404(Document, name=name)
 
-    if (not doc.latest_event(type="started_iesg_process")) or doc.get_state_slug() == "expired":
+    # Steer ADs towards "Begin IESG Processing"
+    if doc.get_state_slug("draft-iesg")=="idexists" and not has_role(request.user,"Secretariat"):
         raise Http404
 
     login = request.user.person
@@ -390,9 +393,9 @@ def replaces(request, name):
                    ))
 
 class SuggestedReplacesForm(forms.Form):
-    replaces = forms.ModelMultipleChoiceField(queryset=Document.objects.all(),
-                                              label="Suggestions", required=False, widget=forms.CheckboxSelectMultiple,
-                                              help_text="Select only the documents that are replaced by this document")
+    replaces = ModelMultipleChoiceField(queryset=Document.objects.all(),
+                                        label="Suggestions", required=False, widget=forms.CheckboxSelectMultiple,
+                                        help_text="Select only the documents that are replaced by this document")
     comment = forms.CharField(label="Optional comment", widget=forms.Textarea, required=False, strip=False)
 
     def __init__(self, suggested, *args, **kwargs):
@@ -486,40 +489,6 @@ def change_intention(request, name):
                                    doc=doc,
                                    ))
 
-class EditInfoForm(forms.Form):
-    intended_std_level = forms.ModelChoiceField(IntendedStdLevelName.objects.filter(used=True), empty_label="(None)", required=True, label="Intended RFC status")
-    area = forms.ModelChoiceField(Group.objects.filter(type="area", state="active"), empty_label="(None - individual submission)", required=False, label="Assigned to area")
-    ad = forms.ModelChoiceField(Person.objects.filter(role__name="ad", role__group__state="active",role__group__type='area').order_by('name'), label="Responsible AD", empty_label="(None)", required=True)
-    create_in_state = forms.ModelChoiceField(State.objects.filter(used=True, type="draft-iesg", slug__in=("pub-req", "watching")), empty_label=None, required=False)
-    notify = forms.CharField(
-        widget=forms.Textarea,
-        max_length=1023,
-        label="Notice emails",
-        help_text="Separate email addresses with commas.",
-        required=False,
-    )
-    telechat_date = forms.TypedChoiceField(coerce=lambda x: datetime.datetime.strptime(x, '%Y-%m-%d').date(), empty_value=None, required=False, widget=forms.Select(attrs={'onchange':'make_bold()'}))
-    returning_item = forms.BooleanField(required=False)
-
-    def __init__(self, *args, **kwargs):
-        super(self.__class__, self).__init__(*args, **kwargs)
-
-        # if previous AD is now ex-AD, append that person to the list
-        ad_pk = self.initial.get('ad')
-        choices = self.fields['ad'].choices
-        if ad_pk and ad_pk not in [pk for pk, name in choices]:
-            self.fields['ad'].choices = list(choices) + [("", "-------"), (ad_pk, Person.objects.get(pk=ad_pk).plain_name())]
-        
-        # telechat choices
-        dates = [d.date for d in TelechatDate.objects.active().order_by('date')]
-        init = kwargs['initial']['telechat_date']
-        if init and init not in dates:
-            dates.insert(0, init)
-
-        self.fields['telechat_date'].choices = [("", "(not on agenda)")] + [(d, d.strftime("%Y-%m-%d")) for d in dates]
-
-        # returning item is rendered non-standard
-        self.standard_fields = [x for x in self.visible_fields() if x.name not in ('returning_item',)]
 
 def to_iesg(request,name):
     """ Submit an IETF stream document to the IESG for publication """ 
@@ -618,7 +587,71 @@ def to_iesg(request,name):
                                    notify=notify,
                                   ))
 
-@role_required('Area Director','Secretariat')
+class EditInfoForm(forms.Form):
+    intended_std_level = forms.ModelChoiceField(
+        IntendedStdLevelName.objects.filter(used=True),
+        empty_label="(None)",
+        required=True,
+        label="Intended RFC status",
+    )
+    area = forms.ModelChoiceField(
+        Group.objects.filter(type="area", state="active"),
+        empty_label="(None - individual submission)",
+        required=False,
+        label="Assigned to area",
+    )
+    ad = forms.ModelChoiceField(
+        Person.objects.filter(
+            role__name="ad", role__group__state="active", role__group__type="area"
+        ).order_by("name"),
+        label="Responsible AD",
+        empty_label="(None)",
+        required=True,
+    )
+    notify = forms.CharField(
+        widget=forms.Textarea,
+        max_length=1023,
+        label="Notice emails",
+        help_text="Separate email addresses with commas.",
+        required=False,
+    )
+    telechat_date = forms.TypedChoiceField(
+        coerce=lambda x: datetime.datetime.strptime(x, "%Y-%m-%d").date(),
+        empty_value=None,
+        required=False,
+        widget=forms.Select(attrs={"onchange": "make_bold()"}),
+    )
+    returning_item = forms.BooleanField(required=False)
+
+    def __init__(self, *args, **kwargs):
+        super(self.__class__, self).__init__(*args, **kwargs)
+
+        # if previous AD is now ex-AD, append that person to the list
+        ad_pk = self.initial.get("ad")
+        choices = self.fields["ad"].choices
+        if ad_pk and ad_pk not in [pk for pk, name in choices]:
+            self.fields["ad"].choices = list(choices) + [
+                ("", "-------"),
+                (ad_pk, Person.objects.get(pk=ad_pk).plain_name()),
+            ]
+
+        # telechat choices
+        dates = [d.date for d in TelechatDate.objects.active().order_by("date")]
+        init = kwargs["initial"]["telechat_date"]
+        if init and init not in dates:
+            dates.insert(0, init)
+
+        self.fields["telechat_date"].choices = [("", "(not on agenda)")] + [
+            (d, d.strftime("%Y-%m-%d")) for d in dates
+        ]
+
+        # returning item is rendered non-standard
+        self.standard_fields = [
+            x for x in self.visible_fields() if x.name not in ("returning_item",)
+        ]
+
+
+@role_required("Area Director", "Secretariat")
 def edit_info(request, name):
     """Edit various Internet-Draft attributes, notifying parties as
     necessary and logging changes as document events."""
@@ -627,7 +660,8 @@ def edit_info(request, name):
         raise Http404
 
     new_document = False
-    if doc.get_state_slug("draft-iesg") == "idexists": # FIXME: should probably receive "new document" as argument to view instead of this
+    # FIXME: should probably receive "new document" as argument to view instead of this
+    if doc.get_state_slug("draft-iesg") == "idexists":
         new_document = True
         doc.notify = get_initial_notify(doc)
 
@@ -635,34 +669,45 @@ def edit_info(request, name):
     initial_telechat_date = e.telechat_date if e else None
     initial_returning_item = bool(e and e.returning_item)
 
-    if request.method == 'POST':
-        form = EditInfoForm(request.POST,
-                            initial=dict(ad=doc.ad_id,
-                                         telechat_date=initial_telechat_date))
+    if request.method == "POST":
+        form = EditInfoForm(
+            request.POST,
+            initial=dict(ad=doc.ad_id, telechat_date=initial_telechat_date),
+        )
         if form.is_valid():
             by = request.user.person
+            pubreq_state = State.objects.get(type="draft-iesg", slug="pub-req")
 
             r = form.cleaned_data
             events = []
 
             if new_document:
-                doc.set_state(r['create_in_state'])
+                doc.set_state(pubreq_state)
 
                 # Is setting the WG state here too much of a hidden side-effect?
-                if r['create_in_state'].slug=='pub-req':
-                    if doc.stream and doc.stream.slug=='ietf' and doc.group and doc.group.type_id == 'wg':
-                        submitted_state = State.objects.get(type='draft-stream-ietf',slug='sub-pub')
-                        doc.set_state(submitted_state)
-                        e = DocEvent()
-                        e.type = "changed_document"
-                        e.by = by
-                        e.doc = doc
-                        e.rev = doc.rev
-                        e.desc = "Working group state set to %s" % submitted_state.name
-                        e.save()
-                        events.append(e)
+                if (
+                    doc.stream
+                    and doc.stream.slug == "ietf"
+                    and doc.group
+                    and doc.group.type_id == "wg"
+                ):
+                    submitted_state = State.objects.get(
+                        type="draft-stream-ietf", slug="sub-pub"
+                    )
+                    doc.set_state(submitted_state)
+                    e = DocEvent()
+                    e.type = "changed_document"
+                    e.by = by
+                    e.doc = doc
+                    e.rev = doc.rev
+                    e.desc = "Working group state set to %s" % submitted_state.name
+                    e.save()
+                    events.append(e)
 
-                replaces = Document.objects.filter(targets_related__source=doc, targets_related__relationship="replaces")
+                replaces = Document.objects.filter(
+                    targets_related__source=doc,
+                    targets_related__relationship="replaces",
+                )
                 if replaces:
                     # this should perhaps be somewhere else, e.g. the
                     # place where the replace relationship is established?
@@ -671,7 +716,10 @@ def edit_info(request, name):
                     e.by = Person.objects.get(name="(System)")
                     e.doc = doc
                     e.rev = doc.rev
-                    e.desc = "Earlier history may be found in the Comment Log for <a href=\"%s\">%s</a>" % (replaces[0], replaces[0].get_absolute_url())
+                    e.desc = (
+                        'Earlier history may be found in the Comment Log for <a href="%s">%s</a>'
+                        % (replaces[0], replaces[0].get_absolute_url())
+                    )
                     e.save()
                     events.append(e)
 
@@ -680,7 +728,10 @@ def edit_info(request, name):
                 e.by = by
                 e.doc = doc
                 e.rev = doc.rev
-                e.desc = "Document is now in IESG state <b>%s</b>" % doc.get_state("draft-iesg").name
+                e.desc = (
+                    "Document is now in IESG state <b>%s</b>"
+                    % doc.get_state("draft-iesg").name
+                )
                 e.save()
                 events.append(e)
 
@@ -690,9 +741,9 @@ def edit_info(request, name):
                 entry = "%(attr)s changed to <b>%(new)s</b> from <b>%(old)s</b>"
                 if new_document:
                     entry = "%(attr)s changed to <b>%(new)s</b>"
-                
+
                 return entry % dict(attr=attr, new=new, old=old)
-            
+
             def diff(attr, name):
                 v = getattr(doc, attr)
                 if r[attr] != v:
@@ -700,9 +751,9 @@ def edit_info(request, name):
                     setattr(doc, attr, r[attr])
 
             # update the attributes, keeping track of what we're doing
-            diff('intended_std_level', "Intended Status")
-            diff('ad', "Responsible AD")
-            diff('notify', "State Change Notice email list")
+            diff("intended_std_level", "Intended Status")
+            diff("ad", "Responsible AD")
+            diff("notify", "State Change Notice email list")
 
             if doc.group.type_id in ("individ", "area"):
                 if not r["area"]:
@@ -716,12 +767,16 @@ def edit_info(request, name):
                     doc.group = r["area"]
 
             for c in changes:
-                events.append(DocEvent.objects.create(doc=doc, rev=doc.rev, by=by, desc=c, type="changed_document"))
+                events.append(
+                    DocEvent.objects.create(
+                        doc=doc, rev=doc.rev, by=by, desc=c, type="changed_document"
+                    )
+                )
 
             # Todo - chase this
-            e = update_telechat(request, doc, by,
-                                r['telechat_date'], r['returning_item'])
-
+            e = update_telechat(
+                request, doc, by, r["telechat_date"], r["returning_item"]
+            )
             if e:
                 events.append(e)
 
@@ -729,40 +784,44 @@ def edit_info(request, name):
 
             if new_document:
                 # If we created a new doc, update the action holders as though it
-                # started in idexists and moved to its create_in_state. Do this
+                # started in idexists and moved to pub-req. Do this
                 # after the doc has been updated so, e.g., doc.ad is set.
                 update_action_holders(
                     doc,
-                    State.objects.get(type='draft-iesg', slug='idexists'),
-                    r['create_in_state']
+                    State.objects.get(type="draft-iesg", slug="idexists"),
+                    pubreq_state,
                 )
 
             if changes:
                 email_iesg_processing_document(request, doc, changes)
-                
+
             return HttpResponseRedirect(doc.get_absolute_url())
     else:
-        init = dict(intended_std_level=doc.intended_std_level_id,
-                    area=doc.group_id,
-                    ad=doc.ad_id,
-                    notify=doc.notify,
-                    telechat_date=initial_telechat_date,
-                    returning_item=initial_returning_item,
-                    )
+        init = dict(
+            intended_std_level=doc.intended_std_level_id,
+            area=doc.group_id,
+            ad=doc.ad_id,
+            notify=doc.notify,
+            telechat_date=initial_telechat_date,
+            returning_item=initial_returning_item,
+        )
 
         form = EditInfoForm(initial=init)
 
     # optionally filter out some fields
-    if not new_document:
-        form.standard_fields = [x for x in form.standard_fields if x.name != "create_in_state"]
     if doc.group.type_id not in ("individ", "area"):
         form.standard_fields = [x for x in form.standard_fields if x.name != "area"]
 
-    return render(request, 'doc/draft/edit_info.html',
-                              dict(doc=doc,
-                                   form=form,
-                                   user=request.user,
-                                   ballot_issued=doc.latest_event(type="sent_ballot_announcement")))
+    return render(
+        request,
+        "doc/draft/edit_info.html",
+        dict(
+            doc=doc,
+            form=form,
+            user=request.user,
+            ballot_issued=doc.latest_event(type="sent_ballot_announcement"),
+        ),
+    )
 
 @role_required('Area Director','Secretariat')
 def request_resurrect(request, name):
@@ -831,11 +890,19 @@ def restore_draft_file(request, draft):
     log.log("Resurrecting %s.  Moving files:" % draft.name)
     for file in files:
         try:
+            # ghostlinkd would keep this in the combined all archive since it would
+            # be sourced from a different place. But when ghostlinkd is removed, nothing
+            # new is needed here - the file will already exist in the combined archive
             shutil.move(file, settings.INTERNET_DRAFT_PATH)
             log.log("  Moved file %s to %s" % (file, settings.INTERNET_DRAFT_PATH))
         except shutil.Error as ex:
             messages.warning(request, 'There was an error restoring the Internet-Draft file: {} ({})'.format(file, ex))
             log.log("  Exception %s when attempting to move %s" % (ex, file))
+        _, ext = os.path.splitext(os.path.basename(file))
+        if ext:
+            ext = ext[1:]
+            blobname = f"{ext}/{basename}.{ext}"
+            store_bytes("active-draft", blobname, retrieve_bytes("draft", blobname))
 
 
 class ShepherdWriteupUploadForm(forms.Form):
@@ -1598,7 +1665,7 @@ class ChangeStreamStateForm(forms.Form):
     new_state = forms.ModelChoiceField(queryset=State.objects.filter(used=True), label='State' )
     weeks = forms.IntegerField(label='Expected weeks in state',required=False)
     comment = forms.CharField(widget=forms.Textarea, required=False, help_text="Optional comment for the document history.", strip=False)
-    tags = forms.ModelMultipleChoiceField(queryset=DocTagName.objects.filter(used=True), widget=forms.CheckboxSelectMultiple, required=False)
+    tags = ModelMultipleChoiceField(queryset=DocTagName.objects.filter(used=True), widget=forms.CheckboxSelectMultiple, required=False)
 
     def __init__(self, *args, **kwargs):
         doc = kwargs.pop("doc")

@@ -3,13 +3,10 @@
 
 
 import datetime
-import io
 import logging                          # pyflakes:ignore
-import os
 import re
 import requests
 import requests_mock
-import shutil
 import time
 import urllib
 
@@ -21,7 +18,6 @@ from oic.oic.message import RegistrationResponse, AuthorizationResponse
 from oic.utils.authn.client import CLIENT_AUTHN_METHOD
 from oidc_provider.models import RSAKey
 from pyquery import PyQuery
-from unittest import skipIf
 from urllib.parse import urlsplit
 
 import django.core.signing
@@ -35,78 +31,46 @@ import debug                            # pyflakes:ignore
 
 from ietf.group.factories import GroupFactory, RoleFactory
 from ietf.group.models import Group, Role, RoleName
-from ietf.ietfauth.htpasswd import update_htpasswd_file
 from ietf.ietfauth.utils import has_role
-from ietf.meeting.factories import MeetingFactory
+from ietf.meeting.factories import MeetingFactory, RegistrationFactory, RegistrationTicketFactory
 from ietf.nomcom.factories import NomComFactory
 from ietf.person.factories import PersonFactory, EmailFactory, UserFactory, PersonalApiKeyFactory
-from ietf.person.models import Person, Email, PersonalApiKey
+from ietf.person.models import Person, Email
+from ietf.person.tasks import send_apikey_usage_emails_task
 from ietf.review.factories import ReviewRequestFactory, ReviewAssignmentFactory
 from ietf.review.models import ReviewWish, UnavailablePeriod
-from ietf.stats.models import MeetingRegistration
-from ietf.utils.decorators import skip_coverage
 from ietf.utils.mail import outbox, empty_outbox, get_payload_text
 from ietf.utils.test_utils import TestCase, login_testing_unauthorized
 from ietf.utils.timezone import date_today
 
 
-import ietf.ietfauth.views
-
-if os.path.exists(settings.HTPASSWD_COMMAND):
-    skip_htpasswd_command = False
-    skip_message = ""
-else:
-    skip_htpasswd_command = True
-    skip_message = ("Skipping htpasswd test: The binary for htpasswd wasn't found in the\n       "
-                    "location indicated in settings.py.")
-    print("     "+skip_message)
-
 class IetfAuthTests(TestCase):
-    def setUp(self):
-        super().setUp()
-        self.saved_use_python_htdigest = getattr(settings, "USE_PYTHON_HTDIGEST", None)
-        settings.USE_PYTHON_HTDIGEST = True
-
-        self.saved_htpasswd_file = settings.HTPASSWD_FILE
-        self.htpasswd_dir = self.tempdir('htpasswd')
-        settings.HTPASSWD_FILE = os.path.join(self.htpasswd_dir, "htpasswd")
-        io.open(settings.HTPASSWD_FILE, 'a').close() # create empty file
-
-        self.saved_htdigest_realm = getattr(settings, "HTDIGEST_REALM", None)
-        settings.HTDIGEST_REALM = "test-realm"
-
-    def tearDown(self):
-        shutil.rmtree(self.htpasswd_dir)
-        settings.USE_PYTHON_HTDIGEST = self.saved_use_python_htdigest
-        settings.HTPASSWD_FILE = self.saved_htpasswd_file
-        settings.HTDIGEST_REALM = self.saved_htdigest_realm
-        super().tearDown()
 
     def test_index(self):
-        self.assertEqual(self.client.get(urlreverse(ietf.ietfauth.views.index)).status_code, 200)
+        self.assertEqual(self.client.get(urlreverse("ietf.ietfauth.views.index")).status_code, 200)
 
     def test_login_and_logout(self):
         PersonFactory(user__username='plain')
 
         # try logging in without a next
-        r = self.client.get(urlreverse(ietf.ietfauth.views.login))
+        r = self.client.get(urlreverse("ietf.ietfauth.views.login"))
         self.assertEqual(r.status_code, 200)
 
-        r = self.client.post(urlreverse(ietf.ietfauth.views.login), {"username":"plain", "password":"plain+password"})
+        r = self.client.post(urlreverse("ietf.ietfauth.views.login"), {"username":"plain", "password":"plain+password"})
         self.assertEqual(r.status_code, 302)
-        self.assertEqual(urlsplit(r["Location"])[2], urlreverse(ietf.ietfauth.views.profile))
+        self.assertEqual(urlsplit(r["Location"])[2], urlreverse("ietf.ietfauth.views.profile"))
 
         # try logging out
         r = self.client.post(urlreverse('django.contrib.auth.views.logout'), {})
         self.assertEqual(r.status_code, 200)
         self.assertNotContains(r, "accounts/logout")
 
-        r = self.client.get(urlreverse(ietf.ietfauth.views.profile))
+        r = self.client.get(urlreverse("ietf.ietfauth.views.profile"))
         self.assertEqual(r.status_code, 302)
-        self.assertEqual(urlsplit(r["Location"])[2], urlreverse(ietf.ietfauth.views.login))
+        self.assertEqual(urlsplit(r["Location"])[2], urlreverse("ietf.ietfauth.views.login"))
 
         # try logging in with a next
-        r = self.client.post(urlreverse(ietf.ietfauth.views.login) + "?next=/foobar", {"username":"plain", "password":"plain+password"})
+        r = self.client.post(urlreverse("ietf.ietfauth.views.login") + "?next=/foobar", {"username":"plain", "password":"plain+password"})
         self.assertEqual(r.status_code, 302)
         self.assertEqual(urlsplit(r["Location"])[2], "/foobar")
 
@@ -137,19 +101,19 @@ class IetfAuthTests(TestCase):
         # try with a trivial next
         _test_login("/")
         # try with a next that requires login
-        _test_login(urlreverse(ietf.ietfauth.views.profile))
+        _test_login(urlreverse("ietf.ietfauth.views.profile"))
 
     def test_login_with_different_email(self):
         person = PersonFactory(user__username='plain')
         email = EmailFactory(person=person)
 
         # try logging in without a next
-        r = self.client.get(urlreverse(ietf.ietfauth.views.login))
+        r = self.client.get(urlreverse("ietf.ietfauth.views.login"))
         self.assertEqual(r.status_code, 200)
 
-        r = self.client.post(urlreverse(ietf.ietfauth.views.login), {"username":email, "password":"plain+password"})
+        r = self.client.post(urlreverse("ietf.ietfauth.views.login"), {"username":email, "password":"plain+password"})
         self.assertEqual(r.status_code, 302)
-        self.assertEqual(urlsplit(r["Location"])[2], urlreverse(ietf.ietfauth.views.profile))
+        self.assertEqual(urlsplit(r["Location"])[2], urlreverse("ietf.ietfauth.views.profile"))
 
     def extract_confirm_url(self, confirm_email):
         # dig out confirm_email link
@@ -163,20 +127,11 @@ class IetfAuthTests(TestCase):
 
         return confirm_url
 
-    def username_in_htpasswd_file(self, username):
-        with io.open(settings.HTPASSWD_FILE) as f:
-            for l in f:
-                if l.startswith(username + ":"):
-                    return True
-        with io.open(settings.HTPASSWD_FILE) as f:
-            print(f.read())
-
-        return False
 
 # For the lowered barrier to account creation period, we are disabling this kind of failure
     # def test_create_account_failure(self):
 
-    #     url = urlreverse(ietf.ietfauth.views.create_account)
+    #     url = urlreverse("ietf.ietfauth.views.create_account")
 
     #     # get
     #     r = self.client.get(url)
@@ -195,7 +150,7 @@ class IetfAuthTests(TestCase):
         self.assertTrue("Additional Assistance Required" in r)
 
     def register(self, email):
-        url = urlreverse(ietf.ietfauth.views.create_account)
+        url = urlreverse("ietf.ietfauth.views.create_account")
 
         # register email
         empty_outbox()
@@ -224,8 +179,6 @@ class IetfAuthTests(TestCase):
         self.assertEqual(Person.objects.filter(user__username=email).count(), 1)
         self.assertEqual(Email.objects.filter(person__user__username=email).count(), 1)
 
-        self.assertTrue(self.username_in_htpasswd_file(email))
-
         
     # This also tests new account creation.
     def test_create_existing_account(self):
@@ -240,7 +193,7 @@ class IetfAuthTests(TestCase):
         note = get_payload_text(outbox[-1])
         self.assertIn(email, note)
         self.assertIn("A datatracker account for that email already exists", note)
-        self.assertIn(urlreverse(ietf.ietfauth.views.password_reset), note)
+        self.assertIn(urlreverse("ietf.ietfauth.views.password_reset"), note)
 
     def test_ietfauth_profile(self):
         EmailFactory(person__user__username='plain')
@@ -249,7 +202,7 @@ class IetfAuthTests(TestCase):
         username = "plain"
         email_address = Email.objects.filter(person__user__username=username).first().address
 
-        url = urlreverse(ietf.ietfauth.views.profile)
+        url = urlreverse("ietf.ietfauth.views.profile")
         login_testing_unauthorized(self, username, url)
 
 
@@ -400,7 +353,7 @@ class IetfAuthTests(TestCase):
     def test_email_case_insensitive_protection(self):
         EmailFactory(address="TestAddress@example.net")
         person = PersonFactory()
-        url = urlreverse(ietf.ietfauth.views.profile)
+        url = urlreverse("ietf.ietfauth.views.profile")
         login_testing_unauthorized(self, person.user.username, url)
 
         data = {
@@ -439,14 +392,14 @@ class IetfAuthTests(TestCase):
         self.assertFalse(q('#volunteer-button'))
         self.assertTrue(q('#volunteered'))
 
-
     def test_reset_password(self):
-        url = urlreverse(ietf.ietfauth.views.password_reset)
-        email = 'someone@example.com'
-        password = 'foobar'
+        VALID_PASSWORD = "complex-and-long-valid-password"
+        ANOTHER_VALID_PASSWORD = "very-complicated-and-lengthy-password"
+        url = urlreverse("ietf.ietfauth.views.password_reset")
+        email = "someone@example.com"
 
         user = PersonFactory(user__email=email).user
-        user.set_password(password)
+        user.set_password(VALID_PASSWORD)
         user.save()
 
         # get
@@ -454,21 +407,23 @@ class IetfAuthTests(TestCase):
         self.assertEqual(r.status_code, 200)
 
         # ask for reset, wrong username (form should not fail)
-        r = self.client.post(url, { 'username': "nobody@example.com" })
+        r = self.client.post(url, {"username": "nobody@example.com"})
         self.assertEqual(r.status_code, 200)
         q = PyQuery(r.content)
         self.assertTrue(len(q("form .is-invalid")) == 0)
 
         # ask for reset
         empty_outbox()
-        r = self.client.post(url, { 'username': user.username })
+        r = self.client.post(url, {"username": user.username})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(len(outbox), 1)
 
         # goto change password page, logged in as someone else
         confirm_url = self.extract_confirm_url(outbox[-1])
         other_user = UserFactory()
-        self.client.login(username=other_user.username, password=other_user.username + '+password')
+        self.client.login(
+            username=other_user.username, password=other_user.username + "+password"
+        )
         r = self.client.get(confirm_url)
         self.assertEqual(r.status_code, 403)
 
@@ -477,21 +432,35 @@ class IetfAuthTests(TestCase):
         r = self.client.get(confirm_url)
         self.assertEqual(r.status_code, 200)
         q = PyQuery(r.content)
-        self.assertNotIn(user.username, q('.nav').text(),
-                         'user should not appear signed in while resetting password')
+        self.assertNotIn(
+            user.username,
+            q(".nav").text(),
+            "user should not appear signed in while resetting password",
+        )
 
         # password mismatch
-        r = self.client.post(confirm_url, { 'password': 'secret', 'password_confirmation': 'nosecret' })
+        r = self.client.post(
+            confirm_url,
+            {
+                "password": ANOTHER_VALID_PASSWORD,
+                "password_confirmation": ANOTHER_VALID_PASSWORD[::-1],
+            },
+        )
         self.assertEqual(r.status_code, 200)
         q = PyQuery(r.content)
         self.assertTrue(len(q("form .is-invalid")) > 0)
 
         # confirm
-        r = self.client.post(confirm_url, { 'password': 'secret', 'password_confirmation': 'secret' })
+        r = self.client.post(
+            confirm_url,
+            {
+                "password": ANOTHER_VALID_PASSWORD,
+                "password_confirmation": ANOTHER_VALID_PASSWORD,
+            },
+        )
         self.assertEqual(r.status_code, 200)
         q = PyQuery(r.content)
         self.assertEqual(len(q("form .is-invalid")), 0)
-        self.assertTrue(self.username_in_htpasswd_file(user.username))
 
         # reuse reset url
         r = self.client.get(confirm_url)
@@ -499,15 +468,18 @@ class IetfAuthTests(TestCase):
 
         # login after reset request
         empty_outbox()
-        user.set_password(password)
+        user.set_password(VALID_PASSWORD)
         user.save()
 
-        r = self.client.post(url, { 'username': user.username })
+        r = self.client.post(url, {"username": user.username})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(len(outbox), 1)
         confirm_url = self.extract_confirm_url(outbox[-1])
 
-        r = self.client.post(urlreverse(ietf.ietfauth.views.login), {'username': email, 'password': password})
+        r = self.client.post(
+            urlreverse("ietf.ietfauth.views.login"),
+            {"username": email, "password": VALID_PASSWORD},
+        )
 
         r = self.client.get(confirm_url)
         self.assertEqual(r.status_code, 404)
@@ -515,12 +487,12 @@ class IetfAuthTests(TestCase):
         # change password after reset request
         empty_outbox()
 
-        r = self.client.post(url, { 'username': user.username })
+        r = self.client.post(url, {"username": user.username})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(len(outbox), 1)
         confirm_url = self.extract_confirm_url(outbox[-1])
 
-        user.set_password('newpassword')
+        user.set_password(ANOTHER_VALID_PASSWORD)
         user.save()
 
         r = self.client.get(confirm_url)
@@ -574,6 +546,24 @@ class IetfAuthTests(TestCase):
         self.assertIn(secondary_address, to)
         self.assertNotIn(inactive_secondary_address, to)
 
+    def test_reset_password_without_user(self):
+        """Reset password using email address for person without a user account"""
+        url = urlreverse('ietf.ietfauth.views.password_reset')
+        email = EmailFactory()
+        person = email.person
+        # Remove the user object from the person to get a Email/Person without User:
+        person.user = None
+        person.save()
+        # Remove the remaining User record, since reset_password looks for that by username:
+        User.objects.filter(username__iexact=email.address).delete()
+        empty_outbox()
+        r = self.client.post(url, { 'username': email.address })
+        self.assertEqual(len(outbox), 1)
+        lastReceivedEmail = outbox[-1]
+        self.assertIn(email.address, lastReceivedEmail.get('To'))
+        self.assertTrue(lastReceivedEmail.get('Subject').startswith("Confirm password reset"))
+        self.assertContains(r, "Your password reset request has been successfully received", status_code=200)
+
     def test_review_overview(self):
         review_req = ReviewRequestFactory()
         assignment = ReviewAssignmentFactory(review_request=review_req,reviewer=EmailFactory(person__user__username='reviewer'))
@@ -589,7 +579,7 @@ class IetfAuthTests(TestCase):
             availability="unavailable",
         )
 
-        url = urlreverse(ietf.ietfauth.views.review_overview)
+        url = urlreverse("ietf.ietfauth.views.review_overview")
 
         login_testing_unauthorized(self, reviewer.user.username, url)
 
@@ -615,117 +605,176 @@ class IetfAuthTests(TestCase):
         self.assertEqual(r.status_code, 302)
         self.assertEqual(ReviewWish.objects.filter(doc=doc, team=review_req.team).count(), 0)
 
-    def test_htpasswd_file_with_python(self):
-        # make sure we test both Python and call-out to binary
-        settings.USE_PYTHON_HTDIGEST = True
-
-        update_htpasswd_file("foo", "passwd")
-        self.assertTrue(self.username_in_htpasswd_file("foo"))
-
-    @skipIf(skip_htpasswd_command, skip_message)
-    @skip_coverage
-    def test_htpasswd_file_with_htpasswd_binary(self):
-        # make sure we test both Python and call-out to binary
-        settings.USE_PYTHON_HTDIGEST = False
-
-        update_htpasswd_file("foo", "passwd")
-        self.assertTrue(self.username_in_htpasswd_file("foo"))
-        
-
     def test_change_password(self):
-
-        chpw_url = urlreverse(ietf.ietfauth.views.change_password)
-        prof_url = urlreverse(ietf.ietfauth.views.profile)
-        login_url = urlreverse(ietf.ietfauth.views.login)
-        redir_url = '%s?next=%s' % (login_url, chpw_url)
+        VALID_PASSWORD = "complex-and-long-valid-password"
+        ANOTHER_VALID_PASSWORD = "very-complicated-and-lengthy-password"
+        chpw_url = urlreverse("ietf.ietfauth.views.change_password")
+        prof_url = urlreverse("ietf.ietfauth.views.profile")
+        login_url = urlreverse("ietf.ietfauth.views.login")
+        redir_url = "%s?next=%s" % (login_url, chpw_url)
 
         # get without logging in
         r = self.client.get(chpw_url)
         self.assertRedirects(r, redir_url)
 
-        user = User.objects.create(username="someone@example.com", email="someone@example.com")
-        user.set_password("password")
+        user = User.objects.create(
+            username="someone@example.com", email="someone@example.com"
+        )
+        user.set_password(VALID_PASSWORD)
         user.save()
         p = Person.objects.create(name="Some One", ascii="Some One", user=user)
         Email.objects.create(address=user.username, person=p, origin=user.username)
 
         # log in
-        r = self.client.post(redir_url, {"username":user.username, "password":"password"})
+        r = self.client.post(
+            redir_url, {"username": user.username, "password": VALID_PASSWORD}
+        )
         self.assertRedirects(r, chpw_url)
 
         # wrong current password
-        r = self.client.post(chpw_url, {"current_password": "fiddlesticks",
-                                        "new_password": "foobar",
-                                        "new_password_confirmation": "foobar",
-                                       })
+        r = self.client.post(
+            chpw_url,
+            {
+                "current_password": "fiddlesticks",
+                "new_password": ANOTHER_VALID_PASSWORD,
+                "new_password_confirmation": ANOTHER_VALID_PASSWORD,
+            },
+        )
         self.assertEqual(r.status_code, 200)
-        self.assertFormError(r.context["form"], 'current_password', 'Invalid password')
+        self.assertFormError(r.context["form"], "current_password", "Invalid password")
 
         # mismatching new passwords
-        r = self.client.post(chpw_url, {"current_password": "password",
-                                        "new_password": "foobar",
-                                        "new_password_confirmation": "barfoo",
-                                       })
+        r = self.client.post(
+            chpw_url,
+            {
+                "current_password": VALID_PASSWORD,
+                "new_password": ANOTHER_VALID_PASSWORD,
+                "new_password_confirmation": ANOTHER_VALID_PASSWORD[::-1],
+            },
+        )
         self.assertEqual(r.status_code, 200)
-        self.assertFormError(r.context["form"], None, "The password confirmation is different than the new password")
+        self.assertFormError(
+            r.context["form"],
+            None,
+            "The password confirmation is different than the new password",
+        )
+
+        # password too short
+        r = self.client.post(
+            chpw_url,
+            {
+                "current_password": VALID_PASSWORD,
+                "new_password": "sh0rtpw0rd",
+                "new_password_confirmation": "sh0rtpw0rd",
+            }
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertFormError(
+            r.context["form"],
+            None,
+            "This password is too short. It must contain at least "
+            f"{settings.PASSWORD_POLICY_MIN_LENGTH} characters."
+        )
+
+        # password too simple
+        r = self.client.post(
+            chpw_url,
+            {
+                "current_password": VALID_PASSWORD,
+                "new_password": "passwordpassword",
+                "new_password_confirmation": "passwordpassword",
+            }
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertFormError(
+            r.context["form"],
+            None,
+            "This password does not meet complexity requirements "
+            "and is easily guessable."
+        )
 
         # correct password change
-        r = self.client.post(chpw_url, {"current_password": "password",
-                                        "new_password": "foobar",
-                                        "new_password_confirmation": "foobar",
-                                       })
+        r = self.client.post(
+            chpw_url,
+            {
+                "current_password": VALID_PASSWORD,
+                "new_password": ANOTHER_VALID_PASSWORD,
+                "new_password_confirmation": ANOTHER_VALID_PASSWORD,
+            },
+        )
         self.assertRedirects(r, prof_url)
         # refresh user object
         user = User.objects.get(username="someone@example.com")
-        self.assertTrue(user.check_password('foobar'))
+        self.assertTrue(user.check_password(ANOTHER_VALID_PASSWORD))
 
     def test_change_username(self):
-
-        chun_url = urlreverse(ietf.ietfauth.views.change_username)
-        prof_url = urlreverse(ietf.ietfauth.views.profile)
-        login_url = urlreverse(ietf.ietfauth.views.login)
-        redir_url = '%s?next=%s' % (login_url, chun_url)
+        VALID_PASSWORD = "complex-and-long-valid-password"
+        chun_url = urlreverse("ietf.ietfauth.views.change_username")
+        prof_url = urlreverse("ietf.ietfauth.views.profile")
+        login_url = urlreverse("ietf.ietfauth.views.login")
+        redir_url = "%s?next=%s" % (login_url, chun_url)
 
         # get without logging in
         r = self.client.get(chun_url)
         self.assertRedirects(r, redir_url)
 
-        user = User.objects.create(username="someone@example.com", email="someone@example.com")
-        user.set_password("password")
+        user = User.objects.create(
+            username="someone@example.com", email="someone@example.com"
+        )
+        user.set_password(VALID_PASSWORD)
         user.save()
         p = Person.objects.create(name="Some One", ascii="Some One", user=user)
         Email.objects.create(address=user.username, person=p, origin=user.username)
-        Email.objects.create(address="othername@example.org", person=p, origin=user.username)
+        Email.objects.create(
+            address="othername@example.org", person=p, origin=user.username
+        )
 
         # log in
-        r = self.client.post(redir_url, {"username":user.username, "password":"password"})
+        r = self.client.post(
+            redir_url, {"username": user.username, "password": VALID_PASSWORD}
+        )
         self.assertRedirects(r, chun_url)
 
         # wrong username
-        r = self.client.post(chun_url, {"username": "fiddlesticks",
-                                        "password": "password",
-                                       })
+        r = self.client.post(
+            chun_url,
+            {
+                "username": "fiddlesticks",
+                "password": VALID_PASSWORD,
+            },
+        )
         self.assertEqual(r.status_code, 200)
-        self.assertFormError(r.context["form"], 'username',
-            "Select a valid choice. fiddlesticks is not one of the available choices.")
+        self.assertFormError(
+            r.context["form"],
+            "username",
+            "Select a valid choice. fiddlesticks is not one of the available choices.",
+        )
 
         # wrong password
-        r = self.client.post(chun_url, {"username": "othername@example.org",
-                                        "password": "foobar",
-                                       })
+        r = self.client.post(
+            chun_url,
+            {
+                "username": "othername@example.org",
+                "password": "foobar",
+            },
+        )
         self.assertEqual(r.status_code, 200)
-        self.assertFormError(r.context["form"], 'password', 'Invalid password')
+        self.assertFormError(r.context["form"], "password", "Invalid password")
 
         # correct username change
-        r = self.client.post(chun_url, {"username": "othername@example.org",
-                                        "password": "password",
-                                       })
+        r = self.client.post(
+            chun_url,
+            {
+                "username": "othername@example.org",
+                "password": VALID_PASSWORD,
+            },
+        )
         self.assertRedirects(r, prof_url)
         # refresh user object
         prev = user
         user = User.objects.get(username="othername@example.org")
         self.assertEqual(prev, user)
-        self.assertTrue(user.check_password('password'))
+        self.assertTrue(user.check_password(VALID_PASSWORD))
 
     def test_apikey_management(self):
         # Create a person with a role that will give at least one valid apikey
@@ -835,9 +884,8 @@ class IetfAuthTests(TestCase):
             self.assertContains(r, 'Invalid apikey', status_code=403)
 
             # invalid apikey (invalidated api key)
-            unauthorized_url = urlreverse('ietf.api.views.app_auth')
-            invalidated_apikey = PersonalApiKey.objects.create(
-                        endpoint=unauthorized_url, person=person, valid=False)
+            unauthorized_url = urlreverse('ietf.api.views.app_auth', kwargs={'app': 'authortools'})
+            invalidated_apikey = PersonalApiKeyFactory(endpoint=unauthorized_url, person=person, valid=False)
             r = self.client.post(unauthorized_url, {'apikey': invalidated_apikey.hash()})
             self.assertContains(r, 'Invalid apikey', status_code=403)
 
@@ -850,15 +898,16 @@ class IetfAuthTests(TestCase):
             person.user.save()
 
             # endpoint mismatch
-            key2 = PersonalApiKey.objects.create(person=person, endpoint='/')
+            key2 = PersonalApiKeyFactory(
+                person=person,
+                endpoint='/',
+                validate_model=False,  # allow invalid endpoint
+            )
             r = self.client.post(key.endpoint, {'apikey':key2.hash(), 'dummy':'dummy',})
             self.assertContains(r, 'Apikey endpoint mismatch', status_code=400)
             key2.delete()
 
     def test_send_apikey_report(self):
-        from ietf.ietfauth.management.commands.send_apikey_usage_emails import Command
-        from ietf.utils.mail import outbox, empty_outbox
-
         person =  RoleFactory(name_id='secr', group__acronym='secretariat').person
 
         url = urlreverse('ietf.ietfauth.views.apikey_create')
@@ -883,9 +932,8 @@ class IetfAuthTests(TestCase):
         date = str(date_today())
 
         empty_outbox()
-        cmd = Command()
-        cmd.handle(verbosity=0, days=7)
-        
+        send_apikey_usage_emails_task(days=7)
+
         self.assertEqual(len(outbox), len(endpoints))
         for mail in outbox:
             body = get_payload_text(mail)
@@ -1064,11 +1112,15 @@ class OpenIDConnectTests(TestCase):
             EmailFactory(person=person)
             email_list = person.email_set.all().values_list('address', flat=True)
             meeting = MeetingFactory(type_id='ietf', date=date_today())
-            MeetingRegistration.objects.create(
-                    meeting=meeting, person=None, first_name=person.first_name(), last_name=person.last_name(),
-                    email=email_list[0], ticket_type='full_week', reg_type='remote', affiliation='Some Company',
-                )
-
+            reg_person = RegistrationFactory(
+                meeting=meeting,
+                person=person,
+                first_name=person.first_name(),
+                last_name=person.last_name(),
+                email=email_list[0],
+                affiliation='Some Company',
+                with_ticket={'attendance_type_id': 'remote', 'ticket_type_id': 'week_pass'},
+            )
             # Get access authorisation
             session = {}
             session["state"] = rndstr()
@@ -1121,35 +1173,48 @@ class OpenIDConnectTests(TestCase):
             for key in ['iss', 'sub', 'aud', 'exp', 'iat', 'auth_time', 'nonce', 'at_hash']:
                 self.assertIn(key, access_token_info['id_token'])
 
-            # Get userinfo, check keys present
+            # Get userinfo, check keys present, most common scenario
             userinfo = client.do_user_info_request(state=params["state"], scope=args['scope'])
             for key in [ 'email', 'family_name', 'given_name', 'meeting', 'name', 'pronouns', 'roles',
                          'ticket_type', 'reg_type', 'affiliation', 'picture', 'dots', ]:
                 self.assertIn(key, userinfo)
                 self.assertTrue(userinfo[key])
             self.assertIn('remote', set(userinfo['reg_type'].split()))
-            self.assertNotIn('hackathon', set(userinfo['reg_type'].split()))
+            self.assertNotIn('hackathon_onsite', set(userinfo['reg_type'].split()))
             self.assertIn(active_group.acronym, [i[1] for i in userinfo['roles']])
             self.assertNotIn(closed_group.acronym, [i[1] for i in userinfo['roles']])
 
-            # Create another registration, with a different email
-            MeetingRegistration.objects.create(
-                    meeting=meeting, person=None, first_name=person.first_name(), last_name=person.last_name(),
-                    email=email_list[1], ticket_type='one_day', reg_type='hackathon', affiliation='Some Company, Inc',
-                )
+            # Create a registration, with only email, no person (rare if at all)
+            reg_person.delete()
+            reg_email = RegistrationFactory(
+                meeting=meeting,
+                person=None,
+                first_name=person.first_name(),
+                last_name=person.last_name(),
+                email=email_list[1],
+                affiliation='Some Company, Inc',
+                with_ticket={'attendance_type_id': 'hackathon_onsite', 'ticket_type_id': 'one_day'},
+            )
             userinfo = client.do_user_info_request(state=params["state"], scope=args['scope'])
-            self.assertIn('hackathon', set(userinfo['reg_type'].split()))
-            self.assertIn('remote', set(userinfo['reg_type'].split()))
-            self.assertIn('full_week', set(userinfo['ticket_type'].split()))
-            self.assertIn('Some Company', userinfo['affiliation'])
+            self.assertIn('hackathon_onsite', set(userinfo['reg_type'].split()))
+            self.assertNotIn('remote', set(userinfo['reg_type'].split()))
+            self.assertIn('one_day', set(userinfo['ticket_type'].split()))
+            self.assertIn('Some Company, Inc', userinfo['affiliation'])
 
-            # Create a third registration, with a composite reg type
-            MeetingRegistration.objects.create(
-                    meeting=meeting, person=None, first_name=person.first_name(), last_name=person.last_name(),
-                    email=email_list[1], ticket_type='one_day', reg_type='hackathon remote', affiliation='Some Company, Inc',
-                )
+            # Test with multiple tickets
+            reg_email.delete()
+            creg = RegistrationFactory(
+                meeting=meeting,
+                person=None,
+                first_name=person.first_name(),
+                last_name=person.last_name(),
+                email=email_list[1],
+                affiliation='Some Company, Inc',
+                with_ticket={'attendance_type_id': 'hackathon_remote', 'ticket_type_id': 'week_pass'},
+            )
+            RegistrationTicketFactory(registration=creg, attendance_type_id='remote', ticket_type_id='week_pass')
             userinfo = client.do_user_info_request(state=params["state"], scope=args['scope'])
-            self.assertEqual(set(userinfo['reg_type'].split()), set(['remote', 'hackathon']))
+            self.assertEqual(set(userinfo['reg_type'].split()), set(['remote', 'hackathon_remote']))
 
             # Check that ending a session works
             r = client.do_end_session_request(state=params["state"], scope=args['scope'])

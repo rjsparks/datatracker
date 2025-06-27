@@ -1,4 +1,4 @@
-# Copyright The IETF Trust 2021, All Rights Reserved
+# Copyright The IETF Trust 2021-2024, All Rights Reserved
 # -*- coding: utf-8 -*-
 """Tests of models in the Meeting application"""
 import datetime
@@ -8,9 +8,11 @@ from mock import patch
 from django.conf import settings
 from django.test import override_settings
 
+import ietf.meeting.models
 from ietf.group.factories import GroupFactory, GroupHistoryFactory
 from ietf.meeting.factories import MeetingFactory, SessionFactory, AttendedFactory, SessionPresentationFactory
-from ietf.stats.factories import MeetingRegistrationFactory
+from ietf.meeting.factories import RegistrationFactory
+from ietf.meeting.models import Session
 from ietf.utils.test_utils import TestCase
 from ietf.utils.timezone import date_today, datetime_today
 
@@ -19,9 +21,9 @@ class MeetingTests(TestCase):
     def test_get_attendance_pre110(self):
         """Pre-110 meetings do not calculate attendance"""
         meeting = MeetingFactory(type_id='ietf', number='109')
-        MeetingRegistrationFactory.create_batch(3, meeting=meeting, reg_type='')
-        MeetingRegistrationFactory.create_batch(4, meeting=meeting, reg_type='remote')
-        MeetingRegistrationFactory.create_batch(5, meeting=meeting, reg_type='in_person')
+        RegistrationFactory.create_batch(3, meeting=meeting, with_ticket={'attendance_type_id': 'unknown'})
+        RegistrationFactory.create_batch(4, meeting=meeting, with_ticket={'attendance_type_id': 'remote'})
+        RegistrationFactory.create_batch(5, meeting=meeting, with_ticket={'attendance_type_id': 'onsite'})
         self.assertIsNone(meeting.get_attendance())
 
     def test_get_attendance_110(self):
@@ -29,31 +31,31 @@ class MeetingTests(TestCase):
         meeting = MeetingFactory(type_id='ietf', number='110')
 
         # start with attendees that should be ignored
-        MeetingRegistrationFactory.create_batch(3, meeting=meeting, reg_type='', attended=True)
-        MeetingRegistrationFactory(meeting=meeting, reg_type='', attended=False)
+        RegistrationFactory.create_batch(3, meeting=meeting, with_ticket={'attendance_type_id': 'unknown'}, attended=True)
+        RegistrationFactory(meeting=meeting, with_ticket={'attendance_type_id': 'unknown'}, attended=False)
         attendance = meeting.get_attendance()
         self.assertIsNotNone(attendance)
         self.assertEqual(attendance.remote, 0)
         self.assertEqual(attendance.onsite, 0)
 
         # add online attendees with at least one who registered but did not attend
-        MeetingRegistrationFactory.create_batch(4, meeting=meeting, reg_type='remote', attended=True)
-        MeetingRegistrationFactory(meeting=meeting, reg_type='remote', attended=False)
+        RegistrationFactory.create_batch(4, meeting=meeting, with_ticket={'attendance_type_id': 'remote'}, attended=True)
+        RegistrationFactory(meeting=meeting, with_ticket={'attendance_type_id': 'remote'}, attended=False)
         attendance = meeting.get_attendance()
         self.assertIsNotNone(attendance)
         self.assertEqual(attendance.remote, 4)
         self.assertEqual(attendance.onsite, 0)
 
         # and the same for onsite attendees
-        MeetingRegistrationFactory.create_batch(5, meeting=meeting, reg_type='onsite', attended=True)
-        MeetingRegistrationFactory(meeting=meeting, reg_type='in_person', attended=False)
+        RegistrationFactory.create_batch(5, meeting=meeting, with_ticket={'attendance_type_id': 'onsite'}, attended=True)
+        RegistrationFactory(meeting=meeting, with_ticket={'attendance_type_id': 'onsite'}, attended=False)
         attendance = meeting.get_attendance()
         self.assertIsNotNone(attendance)
         self.assertEqual(attendance.remote, 4)
         self.assertEqual(attendance.onsite, 5)
 
         # and once more after removing all the online attendees
-        meeting.meetingregistration_set.filter(reg_type='remote').delete()
+        meeting.registration_set.remote().delete()
         attendance = meeting.get_attendance()
         self.assertIsNotNone(attendance)
         self.assertEqual(attendance.remote, 0)
@@ -62,11 +64,11 @@ class MeetingTests(TestCase):
     def test_get_attendance_113(self):
         """Simulate IETF 113 attendance gathering data"""
         meeting = MeetingFactory(type_id='ietf', number='113')
-        MeetingRegistrationFactory(meeting=meeting, reg_type='onsite', attended=True, checkedin=False)
-        MeetingRegistrationFactory(meeting=meeting, reg_type='onsite', attended=False, checkedin=True)
-        p1 = MeetingRegistrationFactory(meeting=meeting, reg_type='onsite', attended=False, checkedin=False).person
+        RegistrationFactory(meeting=meeting, with_ticket={'attendance_type_id': 'onsite'}, attended=True, checkedin=False)
+        RegistrationFactory(meeting=meeting, with_ticket={'attendance_type_id': 'onsite'}, attended=False, checkedin=True)
+        p1 = RegistrationFactory(meeting=meeting, with_ticket={'attendance_type_id': 'onsite'}, attended=False, checkedin=False).person
         AttendedFactory(session__meeting=meeting, person=p1)
-        p2 = MeetingRegistrationFactory(meeting=meeting, reg_type='remote', attended=False, checkedin=False).person
+        p2 = RegistrationFactory(meeting=meeting, with_ticket={'attendance_type_id': 'remote'}, attended=False, checkedin=False).person
         AttendedFactory(session__meeting=meeting, person=p2)
         attendance = meeting.get_attendance()
         self.assertEqual(attendance.onsite, 3)
@@ -80,9 +82,9 @@ class MeetingTests(TestCase):
 
         # Create a person who attended a remote session for first_mtg and onsite for second_mtg without
         # checking in for either.
-        p = MeetingRegistrationFactory(meeting=second_mtg, reg_type='onsite', attended=False, checkedin=False).person
+        p = RegistrationFactory(meeting=second_mtg, with_ticket={'attendance_type_id': 'onsite'}, attended=False, checkedin=False).person
         AttendedFactory(session__meeting=first_mtg, person=p)
-        MeetingRegistrationFactory(meeting=first_mtg, person=p, reg_type='remote', attended=False, checkedin=False)
+        RegistrationFactory(meeting=first_mtg, person=p, with_ticket={'attendance_type_id': 'remote'}, attended=False, checkedin=False)
         AttendedFactory(session__meeting=second_mtg, person=p)
 
         att = first_mtg.get_attendance()
@@ -146,3 +148,53 @@ class SessionTests(TestCase):
         self.assertEqual(session.chat_room_name(), 'plenary')
         session.chat_room = 'fnord'
         self.assertEqual(session.chat_room_name(), 'fnord')
+
+    def test_alpha_str(self):
+        self.assertEqual(Session._alpha_str(0), "a")
+        self.assertEqual(Session._alpha_str(1), "b")
+        self.assertEqual(Session._alpha_str(25), "z")
+        self.assertEqual(Session._alpha_str(26), "aa")
+        self.assertEqual(Session._alpha_str(27 * 26 - 1), "zz")
+        self.assertEqual(Session._alpha_str(27 * 26), "aaa")
+
+    @patch.object(ietf.meeting.models.Session, "_session_recording_url_label", return_value="LABEL")
+    def test_session_recording_url(self, mock):
+        for session_type in ["ietf", "interim"]:
+            session = SessionFactory(meeting__type_id=session_type)
+            with override_settings():
+                if hasattr(settings, "MEETECHO_SESSION_RECORDING_URL"):
+                    del settings.MEETECHO_SESSION_RECORDING_URL
+                self.assertIsNone(session.session_recording_url())
+    
+                settings.MEETECHO_SESSION_RECORDING_URL = "http://player.example.com"
+                self.assertEqual(session.session_recording_url(), "http://player.example.com")
+    
+                settings.MEETECHO_SESSION_RECORDING_URL = "http://player.example.com?{session_label}"
+                self.assertEqual(session.session_recording_url(), "http://player.example.com?LABEL")
+
+                session.meetecho_recording_name="actualname"
+                session.save()
+                self.assertEqual(session.session_recording_url(), "http://player.example.com?actualname")
+
+    def test_session_recording_url_label_ietf(self):
+        session = SessionFactory(
+            meeting__type_id='ietf',
+            meeting__date=date_today(),
+            meeting__number="123",
+            group__acronym="acro",
+        )
+        session_time = session.official_timeslotassignment().timeslot.time
+        self.assertEqual(
+            f"IETF123-ACRO-{session_time:%Y%m%d-%H%M}",  # n.b., time in label is UTC
+            session._session_recording_url_label())
+
+    def test_session_recording_url_label_interim(self):
+        session = SessionFactory(
+            meeting__type_id='interim',
+            meeting__date=date_today(),
+            group__acronym="acro",
+        )
+        session_time = session.official_timeslotassignment().timeslot.time
+        self.assertEqual(
+            f"IETF-ACRO-{session_time:%Y%m%d-%H%M}",  # n.b., time in label is UTC
+            session._session_recording_url_label())

@@ -236,8 +236,12 @@ th,
 
 // Helper to constrain the size of the main logo
 .ietflogo {
-    width: 75%;
+    width: 100%;
     max-width: 300px;
+}
+.ietflogo > img {
+    min-width: 100px;
+    width: 100%;
 }
 
 // Make revision numbers pagination items fixed-width
@@ -691,8 +695,8 @@ td.position-empty {
 }
 
 .edit-meeting-schedule .session.other-session-selected {
-    outline: var(--bs-info) solid 0.2em;
-    /* width matches margin on .session */
+    outline: 0.3em solid var(--bs-info);
+    box-shadow: 0 0 1em var(--bs-info);
     z-index: 2;
     /* render above timeslot outlines */
 }
@@ -1182,4 +1186,33 @@ td.position-empty {
             text-decoration: underline;
         }
     }
+}
+
+blockquote {
+    padding-left: 1rem;
+    border-left: solid 1px var(--bs-body-color);
+}
+
+iframe.status {
+    background-color:transparent;
+    border:none;
+    width:100%;
+    height:3.5em;
+}
+
+.overflow-shadows {
+    transition: box-shadow 0.5s;
+}
+
+.overflow-shadows--both {
+    box-shadow: inset 0px 21px 18px -20px var(--bs-body-color),
+                inset 0px -21px 18px -20px var(--bs-body-color);
+}
+
+.overflow-shadows--top-only {
+    box-shadow: inset 0px 21px 18px -20px var(--bs-body-color);
+}
+
+.overflow-shadows--bottom-only {
+    box-shadow: inset 0px -21px 18px -20px var(--bs-body-color);
 }

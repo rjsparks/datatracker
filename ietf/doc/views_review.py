@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 
-import io
 import itertools
 import json
 import os
 import datetime
+from pathlib import Path
 import requests
 import email.utils
 
@@ -52,7 +52,7 @@ from ietf.utils.text import strip_prefix, xslugify
 from ietf.utils.textupload import get_cleaned_text_file_content
 from ietf.utils.mail import send_mail_message
 from ietf.mailtrigger.utils import gather_address_lists
-from ietf.utils.fields import MultiEmailField
+from ietf.utils.fields import ModelMultipleChoiceField, MultiEmailField
 from ietf.utils.http import is_ajax
 from ietf.utils.response import permission_denied
 from ietf.utils.timezone import date_today, DEADLINE_TZINFO
@@ -68,7 +68,7 @@ def clean_doc_revision(doc, rev):
     return rev
 
 class RequestReviewForm(forms.ModelForm):
-    team = forms.ModelMultipleChoiceField(queryset=Group.objects.all(), widget=forms.CheckboxSelectMultiple)
+    team = ModelMultipleChoiceField(queryset=Group.objects.all(), widget=forms.CheckboxSelectMultiple)
     deadline = DatepickerDateField(date_format="yyyy-mm-dd", picker_settings={ "autoclose": "1", "start-date": "+0d" })
 
     class Meta:
@@ -803,9 +803,14 @@ def complete_review(request, name, assignment_id=None, acronym=None):
             else:
                 content = form.cleaned_data['review_content']
 
-            filename = os.path.join(review.get_file_path(), '{}.txt'.format(review.name))
-            with io.open(filename, 'w', encoding='utf-8') as destination:
-                destination.write(content)
+            review_path = Path(review.get_file_path()) / f"{review.name}.txt"
+            review_path.write_text(content)
+            review.store_str(f"{review.name}.txt", content, allow_overwrite=True) # We have a bug that review revisions dont create a new version!
+            review_ftp_path = Path(settings.FTP_DIR) / "review" / review_path.name
+            # See https://github.com/ietf-tools/datatracker/issues/6941 - when that's
+            # addressed, making this link should not be conditional
+            if not review_ftp_path.exists():
+                os.link(review_path, review_ftp_path) # switch this to Path.hardlink when python>=3.10 is available
 
             completion_datetime = timezone.now()
             if "completion_date" in form.cleaned_data:
@@ -892,7 +897,7 @@ def complete_review(request, name, assignment_id=None, acronym=None):
 
             if need_to_email_review:
                 # email the review
-                subject = "{} {} {} of {}-{}".format(assignment.review_request.team.acronym.capitalize(),assignment.review_request.type.name.lower(),"partial review" if assignment.state_id == "part-completed" else "review", assignment.review_request.doc.name, assignment.reviewed_rev)
+                subject = "{}-{} {} {} {}".format(assignment.review_request.doc.name, assignment.reviewed_rev, assignment.review_request.type.name.lower(), assignment.review_request.team.acronym.capitalize(), "partial review" if assignment.state_id == "part-completed" else "review")
                 related_groups = [ assignment.review_request.team, ]
                 if assignment.review_request.doc.group:
                     related_groups.append(assignment.review_request.doc.group)
@@ -953,14 +958,14 @@ def complete_review(request, name, assignment_id=None, acronym=None):
 
         form = CompleteReviewForm(assignment, doc, team, is_reviewer, initial=initial)
 
-    mail_archive_query_urls = mailarch.construct_query_urls(doc, team)
+    mail_archive_query_data = mailarch.construct_query_data(doc, team)
 
     return render(request, 'doc/review/complete_review.html', {
         'doc': doc,
         'team': team,
         'assignment': assignment,
         'form': form,
-        'mail_archive_query_urls': mail_archive_query_urls,
+        'mail_archive_query_data': mail_archive_query_data,
         'revising_review': revising_review,
         'review_to': to,
         'review_cc': cc,
@@ -982,27 +987,25 @@ def search_mail_archive(request, name, acronym=None, assignment_id=None):
     if not (is_reviewer or can_manage_request):
         permission_denied(request, "You do not have permission to perform this action")
 
-    res = mailarch.construct_query_urls(doc, team, query=request.GET.get("query"))
-    if not res:
-        return JsonResponse({ "error": "Couldn't do lookup in mail archive - don't know where to look"})
-
-    MAX_RESULTS = 30
+    query_data = mailarch.construct_query_data(doc, team, query=request.GET.get("query"))
+    if not query_data:
+        return JsonResponse({"error": "Couldn't do lookup in mail archive - don't know where to look"})
 
     try:
-        res["messages"] = mailarch.retrieve_messages(res["query_data_url"])[:MAX_RESULTS]
-        for message in res["messages"]:
+        query_data["messages"] = mailarch.retrieve_messages(query_data)
+        for message in query_data["messages"]:
             try:
                 revision_guess = message["subject"].split(name)[1].split('-')[1]
                 message["revision_guess"] = revision_guess if revision_guess.isnumeric() else None
             except IndexError:
                 pass
     except KeyError as e:
-        res["error"] = "No results found (%s)" % str(e)
+        query_data["error"] = "No results found (%s)" % str(e)
     except Exception as e:
-        res["error"] = "Retrieval from mail archive failed: %s" % str(e)
+        query_data["error"] = "Retrieval from mail archive failed: %s" % str(e)
         # raise # useful when debugging
 
-    return JsonResponse(res)
+    return JsonResponse(query_data)
 
 class EditReviewRequestCommentForm(forms.ModelForm):
     comment = forms.CharField(widget=forms.Textarea, strip=False)

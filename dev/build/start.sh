@@ -1,10 +1,29 @@
 #!/bin/bash
-
-echo "Running Datatracker checks..."
-./ietf/manage.py check
-
-echo "Running Datatracker migrations..."
-./ietf/manage.py migrate --settings=settings_local
-
-echo "Starting Datatracker..."
-./ietf/manage.py runserver 0.0.0.0:8000 --settings=settings_local
+#
+# Environment config:
+#
+#  CONTAINER_ROLE - datatracker, celery, beat, migrations, or replicator (defaults to datatracker)
+#
+case "${CONTAINER_ROLE:-datatracker}" in
+    auth)
+        exec ./datatracker-start.sh
+        ;;
+    beat)
+        exec ./celery-start.sh --app=ietf beat
+        ;;
+    celery)
+        exec ./celery-start.sh --app=ietf worker
+        ;;
+    datatracker)
+        exec ./datatracker-start.sh
+        ;;
+    migrations)
+        exec ./migration-start.sh
+        ;;
+    replicator)
+        exec ./celery-start.sh --app=ietf worker --queues=blobdb --concurrency=1
+        ;;
+    *)
+        echo "Unknown role '${CONTAINER_ROLE}'"
+        exit 255       
+esac

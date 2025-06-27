@@ -33,7 +33,8 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-
+import hashlib
+import json
 import re
 import datetime
 import copy
@@ -62,13 +63,14 @@ from ietf.doc.models import ( Document, DocHistory, State,
     IESG_BALLOT_ACTIVE_STATES, IESG_STATCHG_CONFLREV_ACTIVE_STATES,
     IESG_CHARTER_ACTIVE_STATES )
 from ietf.doc.fields import select2_id_doc_name_json
-from ietf.doc.utils import get_search_cache_key, augment_events_with_revision, needed_ballot_positions
+from ietf.doc.utils import augment_events_with_revision, needed_ballot_positions
 from ietf.group.models import Group
 from ietf.idindex.index import active_drafts_index_by_group
 from ietf.name.models import DocTagName, DocTypeName, StreamName
 from ietf.person.models import Person
 from ietf.person.utils import get_active_ads
 from ietf.utils.draft_search import normalize_draftname
+from ietf.utils.fields import ModelMultipleChoiceField
 from ietf.utils.log import log
 from ietf.doc.utils_search import prepare_document_table, doc_type, doc_state, doc_type_name, AD_WORKLOAD
 from ietf.ietfauth.utils import has_role
@@ -100,7 +102,7 @@ class SearchForm(forms.Form):
             ("ad", "AD"), ("-ad", "AD (desc)"), ),
         required=False, widget=forms.HiddenInput)
 
-    doctypes = forms.ModelMultipleChoiceField(queryset=DocTypeName.objects.filter(used=True).exclude(slug__in=('draft', 'rfc', 'bcp', 'std', 'fyi', 'liai-att')).order_by('name'), required=False)
+    doctypes = ModelMultipleChoiceField(queryset=DocTypeName.objects.filter(used=True).exclude(slug__in=('draft', 'rfc', 'bcp', 'std', 'fyi', 'liai-att')).order_by('name'), required=False)
 
     def __init__(self, *args, **kwargs):
         super(SearchForm, self).__init__(*args, **kwargs)
@@ -255,7 +257,14 @@ def retrieve_search_results(form, all_types=False):
 
     return docs
 
+
 def search(request):
+    def _get_cache_key(params):
+        fields = set(SearchForm.base_fields) - {'sort'}
+        kwargs = dict([(k, v) for (k, v) in list(params.items()) if k in fields])
+        key = "doc:document:search:" + hashlib.sha512(json.dumps(kwargs, sort_keys=True).encode('utf-8')).hexdigest()
+        return key
+
     if request.GET:
         # backwards compatibility
         get_params = request.GET.copy()
@@ -270,7 +279,7 @@ def search(request):
         if not form.is_valid():
             return HttpResponseBadRequest("form not valid: %s" % form.errors)
 
-        cache_key = get_search_cache_key(get_params)
+        cache_key = _get_cache_key(get_params)
         cached_val = cache.get(cache_key)
         if cached_val:
             [results, meta] = cached_val
@@ -483,6 +492,29 @@ def ad_workload(request):
             "ietf.doc.views_search.docs_for_ad", kwargs=dict(name=ad.full_name_as_key())
         )
         ad.buckets = copy.deepcopy(bucket_template)
+
+        # https://github.com/ietf-tools/datatracker/issues/4577
+        docs_via_group_ad = Document.objects.exclude(
+            group__acronym="none"
+        ).filter(
+            group__role__name="ad",
+            group__role__person=ad
+        ).filter(
+            states__type="draft-stream-ietf",
+            states__slug__in=["wg-doc","wg-lc","waiting-for-implementation","chair-w","writeupw"]
+        )
+
+        doc_for_ad = Document.objects.filter(ad=ad)
+
+        ad.pre_pubreq = (docs_via_group_ad | doc_for_ad).filter(
+            type="draft"
+        ).filter(
+            states__type="draft",
+            states__slug="active"
+        ).filter(
+            states__type="draft-iesg",
+            states__slug="idexists"
+        ).distinct().count()
 
         for doc in Document.objects.exclude(type_id="rfc").filter(ad=ad):
             dt = doc_type(doc)
@@ -720,6 +752,90 @@ def docs_for_ad(request, name):
     )
 
 
+def docs_for_iesg(request):
+    def sort_key(doc):
+        dt = doc_type(doc)
+        dt_key = list(AD_WORKLOAD.keys()).index(dt)
+        ds = doc_state(doc)
+        ds_key = AD_WORKLOAD[dt].index(ds) if ds in AD_WORKLOAD[dt] else 99
+        return dt_key * 100 + ds_key
+
+    results, meta = prepare_document_table(
+        request,
+        Document.objects.filter(
+            ad__in=Person.objects.filter(
+                Q(
+                    role__name__in=("pre-ad", "ad"),
+                    role__group__type="area",
+                    role__group__state="active",
+                )
+            )
+        ).exclude(
+            type_id="rfc",
+        ).exclude(
+            type_id="draft",
+            states__type="draft", 
+            states__slug__in=["repl", "rfc"],
+        ).exclude(
+            type_id="draft",
+            states__type="draft-iesg",
+            states__slug__in=["idexists", "rfcqueue"],
+        ).exclude(
+            type_id="conflrev",
+            states__type="conflrev",
+            states__slug__in=["appr-noprob-sent", "appr-reqnopub-sent", "withdraw", "dead"],
+        ).exclude(
+            type_id="statchg",
+            states__type="statchg",
+            states__slug__in=["appr-sent", "dead"],
+        ).exclude(
+            type_id="charter",
+            states__type="charter",
+            states__slug__in=["notrev", "infrev", "approved", "replaced"],
+        ),
+        max_results=1000,
+        show_ad_and_shepherd=True,
+    )
+    results.sort(key=lambda d: sort_key(d))
+
+    # filter out some results
+    results = [
+        r
+        for r in results
+        if not (
+            r.type_id == "charter"
+            and (
+                r.group.state_id == "abandon"
+                or r.get_state_slug("charter") == "replaced"
+            )
+        )
+        and not (
+            r.type_id == "draft"
+            and (
+                r.get_state_slug("draft-iesg") == "dead"
+                or r.get_state_slug("draft") == "repl"
+                or r.get_state_slug("draft") == "rfc"
+            )
+        )
+    ]
+
+    _calculate_state_name = get_state_name_calculator()
+    for d in results:
+        dt = d.type.slug
+        d.search_heading = _calculate_state_name(dt, doc_state(d))
+        if d.search_heading != "RFC":
+            d.search_heading += f" {doc_type_name(dt)}"
+
+    return render(
+        request,
+        "doc/drafts_for_iesg.html",
+        {
+            "docs": results,
+            "meta": meta,
+        },
+    )
+
+
 def drafts_in_last_call(request):
     lc_state = State.objects.get(type="draft-iesg", slug="lc").pk
     form = SearchForm({'by':'state','state': lc_state, 'rfcs':'on', 'activedrafts':'on'})
@@ -733,7 +849,7 @@ def drafts_in_last_call(request):
     })
 
 def drafts_in_iesg_process(request):
-    states = State.objects.filter(type="draft-iesg").exclude(slug__in=('idexists', 'pub', 'dead', 'watching', 'rfcqueue'))
+    states = State.objects.filter(type="draft-iesg").exclude(slug__in=('idexists', 'pub', 'dead', 'rfcqueue'))
     title = "Documents in IESG process"
 
     grouped_docs = []

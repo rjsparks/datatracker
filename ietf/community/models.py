@@ -1,15 +1,14 @@
 # Copyright The IETF Trust 2012-2020, All Rights Reserved
 # -*- coding: utf-8 -*-
 
-
 from django.db import models
-from django.db.models import signals
 from django.urls import reverse as urlreverse
 
-from ietf.doc.models import Document, DocEvent, State
+from ietf.doc.models import Document, State
 from ietf.group.models import Group
 from ietf.person.models import Person, Email
 from ietf.utils.models import ForeignKey
+
 
 class CommunityList(models.Model):
     person = ForeignKey(Person, blank=True, null=True)
@@ -94,20 +93,3 @@ class EmailSubscription(models.Model):
 
     def __str__(self):
         return "%s to %s (%s changes)" % (self.email, self.community_list, self.notify_on)
-
-
-def notify_events(sender, instance, **kwargs):
-    if not isinstance(instance, DocEvent):
-        return
-
-    if instance.doc.type_id != 'draft':
-        return
-
-    if getattr(instance, "skip_community_list_notification", False):
-        return
-
-    from ietf.community.utils import notify_event_to_subscribers
-    notify_event_to_subscribers(instance)
-
-
-signals.post_save.connect(notify_events)

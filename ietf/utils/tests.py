@@ -1,4 +1,4 @@
-# Copyright The IETF Trust 2014-2020, All Rights Reserved
+# Copyright The IETF Trust 2014-2025, All Rights Reserved
 # -*- coding: utf-8 -*-
 
 
@@ -11,10 +11,11 @@ import pytz
 import shutil
 import types
 
-from mock import patch
+from mock import call, patch
 from pyquery import PyQuery
 from typing import Dict, List       # pyflakes:ignore
 
+from email.message import Message
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -22,6 +23,8 @@ from fnmatch import fnmatch
 from importlib import import_module
 from textwrap import dedent
 from tempfile import mkdtemp
+from xml2rfc import log as xml2rfc_log
+from xml2rfc.util.date import extract_date as xml2rfc_extract_date
 
 from django.apps import apps
 from django.contrib.auth.models import User
@@ -32,27 +35,37 @@ from django.template import Template    # pyflakes:ignore
 from django.template.defaulttags import URLNode
 from django.template.loader import get_template, render_to_string
 from django.templatetags.static import StaticNode
+from django.test import RequestFactory
 from django.urls import reverse as urlreverse
 
 import debug                            # pyflakes:ignore
 
+from ietf.admin.sites import AdminSite
 from ietf.person.name import name_parts, unidecode_name
 from ietf.submit.tests import submission_file
 from ietf.utils.draft import PlaintextDraft, getmeta
 from ietf.utils.fields import SearchableField
 from ietf.utils.log import unreachable, assertion
-from ietf.utils.mail import send_mail_preformatted, send_mail_text, send_mail_mime, outbox, get_payload_text
+from ietf.utils.mail import (
+    send_mail_preformatted,
+    send_mail_text,
+    send_mail_mime,
+    outbox,
+    get_payload_text,
+    decode_header_value,
+    show_that_mail_was_sent,
+)
 from ietf.utils.test_runner import get_template_paths, set_coverage_checking
 from ietf.utils.test_utils import TestCase, unicontent
 from ietf.utils.text import parse_unicode
 from ietf.utils.timezone import timezone_not_near_midnight
-from ietf.utils.xmldraft import XMLDraft
+from ietf.utils.xmldraft import XMLDraft, InvalidMetadataError, capture_xml2rfc_output
 
 class SendingMail(TestCase):
 
     def test_send_mail_preformatted(self):
         msg = """To: to1@example.com, to2@example.com
-From: from1@ietf.org, from2@ietf.org
+From: from1@ietf.org
 Cc: cc1@example.com, cc2@example.com
 Bcc: bcc1@example.com, bcc2@example.com
 Subject: subject
@@ -62,7 +75,7 @@ body
         send_mail_preformatted(None, msg, {}, {})
         recv = outbox[-1]
         self.assertSameEmail(recv['To'], '<to1@example.com>, <to2@example.com>')
-        self.assertSameEmail(recv['From'], 'from1@ietf.org, from2@ietf.org')
+        self.assertSameEmail(recv['From'], 'from1@ietf.org')
         self.assertSameEmail(recv['Cc'], 'cc1@example.com, cc2@example.com')
         self.assertSameEmail(recv['Bcc'], None)
         self.assertEqual(recv['Subject'], 'subject')
@@ -70,14 +83,14 @@ body
 
         override = {
             'To': 'oto1@example.net, oto2@example.net',
-            'From': 'ofrom1@ietf.org, ofrom2@ietf.org',
+            'From': 'ofrom1@ietf.org',
             'Cc': 'occ1@example.net, occ2@example.net',
             'Subject': 'osubject',
         }
         send_mail_preformatted(request=None, preformatted=msg, extra={}, override=override)
         recv = outbox[-1]
         self.assertSameEmail(recv['To'], '<oto1@example.net>, <oto2@example.net>')
-        self.assertSameEmail(recv['From'], 'ofrom1@ietf.org, ofrom2@ietf.org')
+        self.assertSameEmail(recv['From'], 'ofrom1@ietf.org')
         self.assertSameEmail(recv['Cc'], 'occ1@example.net, occ2@example.net')
         self.assertSameEmail(recv['Bcc'], None)
         self.assertEqual(recv['Subject'], 'osubject')
@@ -85,14 +98,14 @@ body
 
         override = {
             'To': ['<oto1@example.net>', 'oto2@example.net'],
-            'From': ['<ofrom1@ietf.org>', 'ofrom2@ietf.org'],
+            'From': ['<ofrom1@ietf.org>'],
             'Cc': ['<occ1@example.net>', 'occ2@example.net'],
             'Subject': 'osubject',
         }
         send_mail_preformatted(request=None, preformatted=msg, extra={}, override=override)
         recv = outbox[-1]
         self.assertSameEmail(recv['To'], '<oto1@example.net>, <oto2@example.net>')
-        self.assertSameEmail(recv['From'], '<ofrom1@ietf.org>, ofrom2@ietf.org')
+        self.assertSameEmail(recv['From'], '<ofrom1@ietf.org>')
         self.assertSameEmail(recv['Cc'], '<occ1@example.net>, occ2@example.net')
         self.assertSameEmail(recv['Bcc'], None)
         self.assertEqual(recv['Subject'], 'osubject')
@@ -107,6 +120,135 @@ body
         send_mail_preformatted(request=None, preformatted=msg, extra=extra, override={})
         recv = outbox[-1]
         self.assertEqual(recv['Fuzz'], 'bucket, monger')
+
+
+class MailUtilsTests(TestCase):
+    def test_decode_header_value(self):
+        self.assertEqual(
+            decode_header_value("cake"),
+            "cake",
+            "decodes simple string value",
+        )
+        self.assertEqual(
+            decode_header_value("=?utf-8?b?8J+Ogg==?="),
+            "\U0001f382",
+            "decodes single utf-8-encoded part",
+        )
+        self.assertEqual(
+            decode_header_value("=?utf-8?b?8J+Ogg==?= = =?macintosh?b?jYxrjg==?="),
+            "\U0001f382 = çåké",
+            "decodes a value with non-utf-8 encodings",
+        )
+
+    # Patch in a side_effect so we can distinguish values that came from decode_header_value.
+    @patch("ietf.utils.mail.decode_header_value", side_effect=lambda s: f"decoded-{s}")
+    @patch("ietf.utils.mail.messages")
+    def test_show_that_mail_was_sent(self, mock_messages, mock_decode_header_value):
+        request = RequestFactory().get("/some/path")
+        request.user = object()  # just needs to exist
+        msg = Message()
+        msg["To"] = "to-value"
+        msg["Subject"] = "subject-value"
+        msg["Cc"] = "cc-value"
+        with patch("ietf.ietfauth.utils.has_role", return_value=True):
+            show_that_mail_was_sent(request, "mail was sent", msg, "bcc-value")
+        self.assertCountEqual(
+            mock_decode_header_value.call_args_list,
+            [call("to-value"), call("subject-value"), call("cc-value"), call("bcc-value")],
+        )
+        self.assertEqual(mock_messages.info.call_args[0][0], request)
+        self.assertIn("mail was sent", mock_messages.info.call_args[0][1])
+        self.assertIn("decoded-subject-value", mock_messages.info.call_args[0][1])
+        self.assertIn("decoded-to-value", mock_messages.info.call_args[0][1])
+        self.assertIn("decoded-cc-value", mock_messages.info.call_args[0][1])
+        self.assertIn("decoded-bcc-value", mock_messages.info.call_args[0][1])
+        mock_messages.reset_mock()
+        mock_decode_header_value.reset_mock()
+
+        # no bcc
+        with patch("ietf.ietfauth.utils.has_role", return_value=True):
+            show_that_mail_was_sent(request, "mail was sent", msg, None)
+        self.assertCountEqual(
+            mock_decode_header_value.call_args_list,
+            [call("to-value"), call("subject-value"), call("cc-value")],
+        )
+        self.assertEqual(mock_messages.info.call_args[0][0], request)
+        self.assertIn("mail was sent", mock_messages.info.call_args[0][1])
+        self.assertIn("decoded-subject-value", mock_messages.info.call_args[0][1])
+        self.assertIn("decoded-to-value", mock_messages.info.call_args[0][1])
+        self.assertIn("decoded-cc-value", mock_messages.info.call_args[0][1])
+        # Note: here and below - when using assertNotIn(), leaving off the "decoded-" prefix
+        # proves that neither the original value nor the decoded value appear.
+        self.assertNotIn("bcc-value", mock_messages.info.call_args[0][1])
+        mock_messages.reset_mock()
+        mock_decode_header_value.reset_mock()
+
+        # no cc
+        del msg["Cc"]
+        with patch("ietf.ietfauth.utils.has_role", return_value=True):
+            show_that_mail_was_sent(request, "mail was sent", msg, None)
+        self.assertCountEqual(
+            mock_decode_header_value.call_args_list,
+            [call("to-value"), call("subject-value")],
+        )
+        self.assertEqual(mock_messages.info.call_args[0][0], request)
+        self.assertIn("mail was sent", mock_messages.info.call_args[0][1])
+        self.assertIn("decoded-subject-value", mock_messages.info.call_args[0][1])
+        self.assertIn("decoded-to-value", mock_messages.info.call_args[0][1])
+        self.assertNotIn("cc-value", mock_messages.info.call_args[0][1])
+        self.assertNotIn("bcc-value", mock_messages.info.call_args[0][1])
+        mock_messages.reset_mock()
+        mock_decode_header_value.reset_mock()
+
+        # no to
+        del msg["To"]
+        with patch("ietf.ietfauth.utils.has_role", return_value=True):
+            show_that_mail_was_sent(request, "mail was sent", msg, None)
+        self.assertCountEqual(
+            mock_decode_header_value.call_args_list,
+            [call("[no to]"), call("subject-value")],
+        )
+        self.assertEqual(mock_messages.info.call_args[0][0], request)
+        self.assertIn("mail was sent", mock_messages.info.call_args[0][1])
+        self.assertIn("decoded-subject-value", mock_messages.info.call_args[0][1])
+        self.assertIn("decoded-[no to]", mock_messages.info.call_args[0][1])
+        self.assertNotIn("to-value", mock_messages.info.call_args[0][1])
+        self.assertNotIn("cc-value", mock_messages.info.call_args[0][1])
+        self.assertNotIn("bcc-value", mock_messages.info.call_args[0][1])
+        mock_messages.reset_mock()
+        mock_decode_header_value.reset_mock()
+
+        # no subject
+        del msg["Subject"]
+        with patch("ietf.ietfauth.utils.has_role", return_value=True):
+            show_that_mail_was_sent(request, "mail was sent", msg, None)
+        self.assertCountEqual(
+            mock_decode_header_value.call_args_list,
+            [call("[no to]"), call("[no subject]")],
+        )
+        self.assertEqual(mock_messages.info.call_args[0][0], request)
+        self.assertIn("mail was sent", mock_messages.info.call_args[0][1])
+        self.assertIn("decoded-[no subject]", mock_messages.info.call_args[0][1])
+        self.assertNotIn("subject-value", mock_messages.info.call_args[0][1])
+        self.assertIn("decoded-[no to]", mock_messages.info.call_args[0][1])
+        self.assertNotIn("to-value", mock_messages.info.call_args[0][1])
+        self.assertNotIn("cc-value", mock_messages.info.call_args[0][1])
+        self.assertNotIn("bcc-value", mock_messages.info.call_args[0][1])
+        mock_messages.reset_mock()
+        mock_decode_header_value.reset_mock()
+        
+        # user does not have role
+        with patch("ietf.ietfauth.utils.has_role", return_value=False):
+            show_that_mail_was_sent(request, "mail was sent", msg, None)
+        self.assertFalse(mock_messages.called)
+        
+        # no user
+        request.user = None
+        with patch("ietf.ietfauth.utils.has_role", return_value=True) as mock_has_role:
+            show_that_mail_was_sent(request, "mail was sent", msg, None)
+        self.assertFalse(mock_messages.called)
+        self.assertFalse(mock_has_role.called)
+
 
 class TestSMTPServer(TestCase):
 
@@ -325,7 +467,7 @@ class AdminTestCase(TestCase):
         User.objects.create_superuser('admin', 'admin@example.org', 'admin+password')
         self.client.login(username='admin', password='admin+password')
         rtop = self.client.get("/admin/")
-        self.assertContains(rtop, 'Django administration')
+        self.assertContains(rtop, AdminSite.site_header())
         for name in self.apps:
             app_name = self.apps[name]
             self.assertContains(rtop, name)
@@ -404,7 +546,7 @@ class XMLDraftTests(TestCase):
     def test_parse_creation_date(self):
         # override date_today to avoid skew when test runs around midnight
         today = datetime.date.today()
-        with patch("ietf.utils.xmldraft.date_today", return_value=today):
+        with capture_xml2rfc_output(), patch("ietf.utils.xmldraft.date_today", return_value=today):
             # Note: using a dict as a stand-in for XML elements, which rely on the get() method
             self.assertEqual(
                 XMLDraft.parse_creation_date({"year": "2022", "month": "11", "day": "24"}),
@@ -450,6 +592,74 @@ class XMLDraftTests(TestCase):
                 ),
                 datetime.date(today.year, 1 if today.month != 1 else 2, 15),
             )
+            # Some exeception-inducing conditions
+            with self.assertRaises(
+                InvalidMetadataError,
+                msg="raise an InvalidMetadataError if a year-only date is not current",
+            ):
+                XMLDraft.parse_creation_date(
+                    {
+                        "year": str(today.year - 1),
+                        "month": "",
+                        "day": "",
+                    }
+                )
+            with self.assertRaises(
+                InvalidMetadataError,
+                msg="raise an InvalidMetadataError for a non-numeric year"
+            ):
+                XMLDraft.parse_creation_date(
+                    {
+                        "year": "two thousand twenty-five",
+                        "month": "2",
+                        "day": "28",
+                    }
+                )
+            with self.assertRaises(
+                InvalidMetadataError,
+                msg="raise an InvalidMetadataError for an invalid month"
+            ):
+                XMLDraft.parse_creation_date(
+                    {
+                        "year": "2024",
+                        "month": "13",
+                        "day": "28",
+                    }
+                )
+            with self.assertRaises(
+                InvalidMetadataError,
+                msg="raise an InvalidMetadataError for a misspelled month"
+            ):
+                XMLDraft.parse_creation_date(
+                    {
+                        "year": "2024",
+                        "month": "Oktobur",
+                        "day": "28",
+                    }
+                )
+            with self.assertRaises(
+                InvalidMetadataError,
+                msg="raise an InvalidMetadataError for an invalid day"
+            ):
+                XMLDraft.parse_creation_date(
+                    {
+                        "year": "2024",
+                        "month": "feb",
+                        "day": "31",
+                    }
+                )
+            with self.assertRaises(
+                InvalidMetadataError,
+                msg="raise an InvalidMetadataError for a non-numeric day"
+            ):
+                XMLDraft.parse_creation_date(
+                    {
+                        "year": "2024",
+                        "month": "feb",
+                        "day": "twenty-four",
+                    }
+                )
+
 
     def test_parse_docname(self):
         with self.assertRaises(ValueError) as cm:
@@ -485,6 +695,101 @@ class XMLDraftTests(TestCase):
             XMLDraft.parse_docname(lxml.etree.Element("xml", docName="-01")),
             ("-01", None),
         )
+
+    def test_render_author_name(self):
+        self.assertEqual(
+            XMLDraft.render_author_name(lxml.etree.Element("author", fullname="Joanna Q. Public")),
+            "Joanna Q. Public",
+        )
+        self.assertEqual(
+            XMLDraft.render_author_name(lxml.etree.Element(
+                "author",
+                fullname="Joanna Q. Public",
+                asciiFullname="Not the Same at All",
+            )),
+            "Joanna Q. Public",
+        )
+        self.assertEqual(
+            XMLDraft.render_author_name(lxml.etree.Element(
+                "author",
+                fullname="Joanna Q. Public",
+                initials="J. Q.",
+                surname="Public-Private",
+            )),
+            "Joanna Q. Public",
+        )
+        self.assertEqual(
+            XMLDraft.render_author_name(lxml.etree.Element(
+                "author",
+                initials="J. Q.",
+                surname="Public",
+            )),
+            "J. Q. Public",
+        )
+        self.assertEqual(
+            XMLDraft.render_author_name(lxml.etree.Element(
+                "author",
+                surname="Public",
+            )),
+            "Public",
+        )
+        self.assertEqual(
+            XMLDraft.render_author_name(lxml.etree.Element(
+                "author",
+                initials="J. Q.",
+            )),
+            "J. Q.",
+        )
+
+    @patch("ietf.utils.xmldraft.XMLDraft.__init__", return_value=None)
+    def test_get_title(self, mock_init):
+        xmldraft = XMLDraft("fake")
+        self.assertTrue(mock_init.called)
+        # Stub XML that does not have a front/title element
+        xmldraft.xmlroot = lxml.etree.XML(
+            "<rfc><front></front></rfc>"  # no title
+        )
+        self.assertEqual(xmldraft.get_title(), "")
+
+        # Stub XML that has a front/title element
+        xmldraft.xmlroot = lxml.etree.XML(
+            "<rfc><front><title>This Is the Title</title></front></rfc>"
+        )
+        self.assertEqual(xmldraft.get_title(), "This Is the Title")
+
+        
+    def test_capture_xml2rfc_output(self):
+        """capture_xml2rfc_output reroutes and captures xml2rfc logs"""
+        orig_write_out = xml2rfc_log.write_out
+        orig_write_err = xml2rfc_log.write_err
+        with capture_xml2rfc_output() as outer_log_streams:  # ensure no output
+            # such meta! very Inception!
+            with capture_xml2rfc_output() as inner_log_streams:
+                # arbitrary xml2rfc method that triggers a log, nothing special otherwise
+                xml2rfc_extract_date({"year": "fish"}, datetime.date(2025,3,1))
+            self.assertNotEqual(inner_log_streams, outer_log_streams)
+            self.assertEqual(xml2rfc_log.write_out, outer_log_streams["stdout"], "out stream should be restored")
+            self.assertEqual(xml2rfc_log.write_err, outer_log_streams["stderr"], "err stream should be restored")
+        self.assertEqual(xml2rfc_log.write_out, orig_write_out, "original out stream should be restored")
+        self.assertEqual(xml2rfc_log.write_err, orig_write_err, "original err stream should be restored")
+
+        # don't happen to get any output on stdout and not paranoid enough to force some, just test stderr
+        self.assertGreater(len(inner_log_streams["stderr"].getvalue()), 0, "want output on inner streams")
+        self.assertEqual(len(outer_log_streams["stdout"].getvalue()), 0, "no output on outer streams")
+        self.assertEqual(len(outer_log_streams["stderr"].getvalue()), 0, "no output on outer streams")
+
+    def test_capture_xml2rfc_output_exception_handling(self):
+        """capture_xml2rfc_output restores streams after an exception"""
+        orig_write_out = xml2rfc_log.write_out
+        orig_write_err = xml2rfc_log.write_err
+        with capture_xml2rfc_output() as outer_log_streams:  # ensure no output
+            with self.assertRaises(RuntimeError), capture_xml2rfc_output() as inner_log_streams:
+                raise RuntimeError("nooo")
+            self.assertNotEqual(inner_log_streams, outer_log_streams)
+            self.assertEqual(xml2rfc_log.write_out, outer_log_streams["stdout"], "out stream should be restored")
+            self.assertEqual(xml2rfc_log.write_err, outer_log_streams["stderr"], "err stream should be restored")
+        self.assertEqual(xml2rfc_log.write_out, orig_write_out, "original out stream should be restored")
+        self.assertEqual(xml2rfc_log.write_err, orig_write_err, "original err stream should be restored")
 
 
 class NameTests(TestCase):
@@ -634,3 +939,12 @@ class SearchableFieldTests(TestCase):
         self.assertTrue(changed_form.has_changed())
         unchanged_form = TestForm(initial={'test_field': [1]}, data={'test_field': [1]})
         self.assertFalse(unchanged_form.has_changed())
+
+
+class HealthTests(TestCase):
+    def test_health(self):
+        self.assertEqual(
+            self.client.get("/health/").status_code,
+            200,
+        )
+            

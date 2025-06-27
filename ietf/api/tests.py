@@ -1,6 +1,7 @@
-# Copyright The IETF Trust 2015-2020, All Rights Reserved
+# Copyright The IETF Trust 2015-2024, All Rights Reserved
 # -*- coding: utf-8 -*-
-
+import base64
+import copy
 import datetime
 import json
 import html
@@ -10,6 +11,7 @@ import sys
 
 from importlib import import_module
 from pathlib import Path
+from random import randrange
 
 from django.apps import apps
 from django.conf import settings
@@ -24,28 +26,31 @@ from tastypie.test import ResourceTestCaseMixin
 import debug                            # pyflakes:ignore
 
 import ietf
+from ietf.doc.storage_utils import retrieve_str
 from ietf.doc.utils import get_unicode_document_content
 from ietf.doc.models import RelatedDocument, State
 from ietf.doc.factories import IndividualDraftFactory, WgDraftFactory, WgRfcFactory
 from ietf.group.factories import RoleFactory
 from ietf.meeting.factories import MeetingFactory, SessionFactory
-from ietf.meeting.models import Session
-from ietf.nomcom.models import Volunteer, NomCom
+from ietf.meeting.models import Session, Registration
+from ietf.nomcom.models import Volunteer
 from ietf.nomcom.factories import NomComFactory, nomcom_kwargs_for_year
-from ietf.person.factories import PersonFactory, random_faker, EmailFactory
+from ietf.person.factories import PersonFactory, random_faker, EmailFactory, PersonalApiKeyFactory
 from ietf.person.models import Email, User
-from ietf.person.models import PersonalApiKey
 from ietf.stats.models import MeetingRegistration
-from ietf.utils.mail import outbox, get_payload_text
+from ietf.utils.mail import empty_outbox, outbox, get_payload_text
 from ietf.utils.models import DumpInfo
 from ietf.utils.test_utils import TestCase, login_testing_unauthorized, reload_db_objects
 
 from .ietf_utils import is_valid_token, requires_api_token
+from .views import EmailIngestionError
 
 OMITTED_APPS = (
     'ietf.secr.meetings',
     'ietf.secr.proceedings',
     'ietf.ipr',
+    'ietf.status',
+    'ietf.blobdb',
 )
 
 class CustomApiTests(TestCase):
@@ -68,7 +73,7 @@ class CustomApiTests(TestCase):
         meeting = MeetingFactory(type_id='ietf')
         session = SessionFactory(group__type_id='wg', meeting=meeting)
         group = session.group
-        apikey = PersonalApiKey.objects.create(endpoint=url, person=recman)
+        apikey = PersonalApiKeyFactory(endpoint=url, person=recman)
         video = 'https://foo.example.com/bar/beer/'
 
         # error cases
@@ -76,7 +81,7 @@ class CustomApiTests(TestCase):
         self.assertContains(r, "Missing apikey parameter", status_code=400)
 
         badrole  = RoleFactory(group__type_id='ietf', name_id='ad')
-        badapikey = PersonalApiKey.objects.create(endpoint=url, person=badrole.person)
+        badapikey = PersonalApiKeyFactory(endpoint=url, person=badrole.person)
         badrole.person.user.last_login = timezone.now()
         badrole.person.user.save()
         r = self.client.post(url, {'apikey': badapikey.hash()} )
@@ -148,7 +153,7 @@ class CustomApiTests(TestCase):
         recman = recmanrole.person
         meeting = MeetingFactory(type_id="ietf")
         session = SessionFactory(group__type_id="wg", meeting=meeting)
-        apikey = PersonalApiKey.objects.create(endpoint=url, person=recman)
+        apikey = PersonalApiKeyFactory(endpoint=url, person=recman)
         video = "https://foo.example.com/bar/beer/"
 
         # error cases
@@ -156,7 +161,7 @@ class CustomApiTests(TestCase):
         self.assertContains(r, "Missing apikey parameter", status_code=400)
 
         badrole = RoleFactory(group__type_id="ietf", name_id="ad")
-        badapikey = PersonalApiKey.objects.create(endpoint=url, person=badrole.person)
+        badapikey = PersonalApiKeyFactory(endpoint=url, person=badrole.person)
         badrole.person.user.last_login = timezone.now()
         badrole.person.user.save()
         r = self.client.post(url, {"apikey": badapikey.hash()})
@@ -219,6 +224,70 @@ class CustomApiTests(TestCase):
         event = doc.latest_event()
         self.assertEqual(event.by, recman)
 
+    def test_api_set_meetecho_recording_name(self):
+        url = urlreverse("ietf.meeting.views.api_set_meetecho_recording_name")
+        recmanrole = RoleFactory(group__type_id="ietf", name_id="recman")
+        recman = recmanrole.person
+        meeting = MeetingFactory(type_id="ietf")
+        session = SessionFactory(group__type_id="wg", meeting=meeting)
+        apikey = PersonalApiKeyFactory(endpoint=url, person=recman)
+        name = "testname"
+
+        # error cases
+        r = self.client.post(url, {})
+        self.assertContains(r, "Missing apikey parameter", status_code=400)
+
+        badrole = RoleFactory(group__type_id="ietf", name_id="ad")
+        badapikey = PersonalApiKeyFactory(endpoint=url, person=badrole.person)
+        badrole.person.user.last_login = timezone.now()
+        badrole.person.user.save()
+        r = self.client.post(url, {"apikey": badapikey.hash()})
+        self.assertContains(r, "Restricted to role: Recording Manager", status_code=403)
+
+        r = self.client.post(url, {"apikey": apikey.hash()})
+        self.assertContains(r, "Too long since last regular login", status_code=400)
+        recman.user.last_login = timezone.now()
+        recman.user.save()
+
+        r = self.client.get(url, {"apikey": apikey.hash()})
+        self.assertContains(r, "Method not allowed", status_code=405)
+
+        r = self.client.post(url, {"apikey": apikey.hash()})
+        self.assertContains(r, "Missing session_id parameter", status_code=400)
+
+        r = self.client.post(url, {"apikey": apikey.hash(), "session_id": session.pk})
+        self.assertContains(r, "Missing name parameter", status_code=400)
+
+        bad_pk = int(Session.objects.order_by("-pk").first().pk) + 1
+        r = self.client.post(
+            url,
+            {
+                "apikey": apikey.hash(),
+                "session_id": bad_pk,
+                "name": name,
+            },
+        )
+        self.assertContains(r, "Session not found", status_code=400)
+
+        r = self.client.post(
+            url,
+            {
+                "apikey": apikey.hash(),
+                "session_id": "foo",
+                "name": name,
+            },
+        )
+        self.assertContains(r, "Invalid session_id", status_code=400)
+
+        r = self.client.post(
+            url, {"apikey": apikey.hash(), "session_id": session.pk, "name": name}
+        )
+        self.assertContains(r, "Done", status_code=200)
+
+        session.refresh_from_db()
+        self.assertEqual(session.meetecho_recording_name, name)
+
+
     def test_api_add_session_attendees_deprecated(self):
         # Deprecated test - should be removed when we stop accepting a simple list of user PKs in
         # the add_session_attendees() view
@@ -228,10 +297,10 @@ class CustomApiTests(TestCase):
         recman = recmanrole.person
         meeting = MeetingFactory(type_id='ietf')
         session = SessionFactory(group__type_id='wg', meeting=meeting)  
-        apikey = PersonalApiKey.objects.create(endpoint=url, person=recman)
+        apikey = PersonalApiKeyFactory(endpoint=url, person=recman)
 
         badrole  = RoleFactory(group__type_id='ietf', name_id='ad')
-        badapikey = PersonalApiKey.objects.create(endpoint=url, person=badrole.person)
+        badapikey = PersonalApiKeyFactory(endpoint=url, person=badrole.person)
         badrole.person.user.last_login = timezone.now()
         badrole.person.user.save()
 
@@ -294,10 +363,10 @@ class CustomApiTests(TestCase):
         recman = recmanrole.person
         meeting = MeetingFactory(type_id="ietf")
         session = SessionFactory(group__type_id="wg", meeting=meeting)
-        apikey = PersonalApiKey.objects.create(endpoint=url, person=recman)
+        apikey = PersonalApiKeyFactory(endpoint=url, person=recman)
 
         badrole = RoleFactory(group__type_id="ietf", name_id="ad")
-        badapikey = PersonalApiKey.objects.create(endpoint=url, person=badrole.person)
+        badapikey = PersonalApiKeyFactory(endpoint=url, person=badrole.person)
         badrole.person.user.last_login = timezone.now()
         badrole.person.user.save()
 
@@ -450,8 +519,8 @@ class CustomApiTests(TestCase):
             ),
         ):
             url = urlreverse(f"ietf.meeting.views.api_upload_{type_id}")
-            apikey = PersonalApiKey.objects.create(endpoint=url, person=recmanrole.person)
-            badapikey = PersonalApiKey.objects.create(endpoint=url, person=badrole.person)
+            apikey = PersonalApiKeyFactory(endpoint=url, person=recmanrole.person)
+            badapikey = PersonalApiKeyFactory(endpoint=url, person=badrole.person)
 
             r = self.client.post(url, {})
             self.assertContains(r, "Missing apikey parameter", status_code=400)
@@ -487,98 +556,10 @@ class CustomApiTests(TestCase):
             newdoc = session.presentations.get(document__type_id=type_id).document
             newdoccontent = get_unicode_document_content(newdoc.name, Path(session.meeting.get_materials_path()) / type_id / newdoc.uploaded_filename)
             self.assertEqual(json.loads(content), json.loads(newdoccontent))
-
-    def test_deprecated_api_upload_bluesheet(self):
-        url = urlreverse('ietf.meeting.views.api_upload_bluesheet')
-        recmanrole = RoleFactory(group__type_id='ietf', name_id='recman')
-        recman = recmanrole.person
-        meeting = MeetingFactory(type_id='ietf')
-        session = SessionFactory(group__type_id='wg', meeting=meeting)
-        group = session.group
-        apikey = PersonalApiKey.objects.create(endpoint=url, person=recman)
-
-        people = [
-            {"name": "Andrea Andreotti", "affiliation": "Azienda"},
-            {"name": "Bosse Bernadotte", "affiliation": "Bolag"},
-            {"name": "Charles Charlemagne", "affiliation": "Compagnie"},
-        ]
-        for i in range(3):
-            faker = random_faker()
-            people.append(dict(name=faker.name(), affiliation=faker.company()))
-        bluesheet = json.dumps(people)
-
-        # error cases
-        r = self.client.post(url, {})
-        self.assertContains(r, "Missing apikey parameter", status_code=400)
-
-        badrole = RoleFactory(group__type_id='ietf', name_id='ad')
-        badapikey = PersonalApiKey.objects.create(endpoint=url, person=badrole.person)
-        badrole.person.user.last_login = timezone.now()
-        badrole.person.user.save()
-        r = self.client.post(url, {'apikey': badapikey.hash()})
-        self.assertContains(r, "Restricted to roles: Recording Manager, Secretariat", status_code=403)
-
-        r = self.client.post(url, {'apikey': apikey.hash()})
-        self.assertContains(r, "Too long since last regular login", status_code=400)
-        recman.user.last_login = timezone.now()
-        recman.user.save()
-
-        r = self.client.get(url, {'apikey': apikey.hash()})
-        self.assertContains(r, "Method not allowed", status_code=405)
-
-        r = self.client.post(url, {'apikey': apikey.hash(), 'group': group.acronym})
-        self.assertContains(r, "Missing meeting parameter", status_code=400)
-
-        r = self.client.post(url, {'apikey': apikey.hash(), 'meeting': meeting.number, })
-        self.assertContains(r, "Missing group parameter", status_code=400)
-
-        r = self.client.post(url, {'apikey': apikey.hash(), 'meeting': meeting.number, 'group': group.acronym})
-        self.assertContains(r, "Missing item parameter", status_code=400)
-
-        r = self.client.post(url,
-                             {'apikey': apikey.hash(), 'meeting': meeting.number, 'group': group.acronym, 'item': '1'})
-        self.assertContains(r, "Missing bluesheet parameter", status_code=400)
-
-        r = self.client.post(url, {'apikey': apikey.hash(), 'meeting': '1', 'group': group.acronym,
-                                   'item': '1', 'bluesheet': bluesheet, })
-        self.assertContains(r, "No sessions found for meeting", status_code=400)
-
-        r = self.client.post(url, {'apikey': apikey.hash(), 'meeting': meeting.number, 'group': 'bogous',
-                                   'item': '1', 'bluesheet': bluesheet, })
-        self.assertContains(r, "No sessions found in meeting '%s' for group 'bogous'" % meeting.number, status_code=400)
-
-        r = self.client.post(url, {'apikey': apikey.hash(), 'meeting': meeting.number, 'group': group.acronym,
-                                   'item': '1', 'bluesheet': "foobar", })
-        self.assertContains(r, "Invalid json value: 'foobar'", status_code=400)
-
-        r = self.client.post(url, {'apikey': apikey.hash(), 'meeting': meeting.number, 'group': group.acronym,
-                                   'item': '5', 'bluesheet': bluesheet, })
-        self.assertContains(r, "No item '5' found in list of sessions for group", status_code=400)
-
-        r = self.client.post(url, {'apikey': apikey.hash(), 'meeting': meeting.number, 'group': group.acronym,
-                                   'item': 'foo', 'bluesheet': bluesheet, })
-        self.assertContains(r, "Expected a numeric value for 'item', found 'foo'", status_code=400)
-
-        r = self.client.post(url, {'apikey': apikey.hash(), 'meeting': meeting.number, 'group': group.acronym,
-                                   'item': '1', 'bluesheet': bluesheet, })
-        self.assertContains(r, "Done", status_code=200)
-
-        # Submit again, with slightly different content, as an updated version
-        people[1]['affiliation'] = 'Bolaget AB'
-        bluesheet = json.dumps(people)
-        r = self.client.post(url, {'apikey': apikey.hash(), 'meeting': meeting.number, 'group': group.acronym,
-                                   'item': '1', 'bluesheet': bluesheet, })
-        self.assertContains(r, "Done", status_code=200)
-
-        bluesheet = session.presentations.filter(document__type__slug='bluesheets').first().document
-        # We've submitted an update; check that the rev is right
-        self.assertEqual(bluesheet.rev, '01')
-        # Check the content
-        with open(bluesheet.get_file_name()) as file:
-            text = file.read()
-            for p in people:
-                self.assertIn(p['name'], html.unescape(text))
-                self.assertIn(p['affiliation'], html.unescape(text))
+            self.assertEqual(
+                json.loads(retrieve_str(type_id, newdoc.uploaded_filename)),
+                json.loads(content)
+            )
 
     def test_api_upload_bluesheet(self):
         url = urlreverse("ietf.meeting.views.api_upload_bluesheet")
@@ -586,8 +567,7 @@ class CustomApiTests(TestCase):
         recman = recmanrole.person
         meeting = MeetingFactory(type_id="ietf")
         session = SessionFactory(group__type_id="wg", meeting=meeting)
-        group = session.group
-        apikey = PersonalApiKey.objects.create(endpoint=url, person=recman)
+        apikey = PersonalApiKeyFactory(endpoint=url, person=recman)
 
         people = [
             {"name": "Andrea Andreotti", "affiliation": "Azienda"},
@@ -604,7 +584,7 @@ class CustomApiTests(TestCase):
         self.assertContains(r, "Missing apikey parameter", status_code=400)
 
         badrole = RoleFactory(group__type_id="ietf", name_id="ad")
-        badapikey = PersonalApiKey.objects.create(endpoint=url, person=badrole.person)
+        badapikey = PersonalApiKeyFactory(endpoint=url, person=badrole.person)
         badrole.person.user.last_login = timezone.now()
         badrole.person.user.save()
         r = self.client.post(url, {"apikey": badapikey.hash()})
@@ -625,18 +605,6 @@ class CustomApiTests(TestCase):
 
         r = self.client.post(url, {"apikey": apikey.hash(), "session_id": session.pk})
         self.assertContains(r, "Missing bluesheet parameter", status_code=400)
-
-        r = self.client.post(
-            url,
-            {
-                "apikey": apikey.hash(),
-                "meeting": meeting.number,
-                "group": group.acronym,
-                "item": "1",
-                "bluesheet": "foobar",
-            },
-        )
-        self.assertContains(r, "Invalid json value: 'foobar'", status_code=400)
 
         bad_session_pk = int(Session.objects.order_by("-pk").first().pk) + 1
         r = self.client.post(
@@ -676,9 +644,7 @@ class CustomApiTests(TestCase):
             url,
             {
                 "apikey": apikey.hash(),
-                "meeting": meeting.number,
-                "group": group.acronym,
-                "item": "1",
+                "session_id": session.pk,
                 "bluesheet": bluesheet,
             },
         )
@@ -714,14 +680,14 @@ class CustomApiTests(TestCase):
         url = urlreverse('ietf.api.views.ApiV2PersonExportView')
         robot = PersonFactory(user__is_staff=True)
         RoleFactory(name_id='robot', person=robot, email=robot.email(), group__acronym='secretariat')
-        apikey = PersonalApiKey.objects.create(endpoint=url, person=robot)
+        apikey = PersonalApiKeyFactory(endpoint=url, person=robot)
 
         # error cases
         r = self.client.post(url, {})
         self.assertContains(r, "Missing apikey parameter", status_code=400)
 
         badrole = RoleFactory(group__type_id='ietf', name_id='ad')
-        badapikey = PersonalApiKey.objects.create(endpoint=url, person=badrole.person)
+        badapikey = PersonalApiKeyFactory(endpoint=url, person=badrole.person)
         badrole.person.user.last_login = timezone.now()
         badrole.person.user.save()
         r = self.client.post(url, {'apikey': badapikey.hash()})
@@ -760,7 +726,7 @@ class CustomApiTests(TestCase):
         oidcp = PersonFactory(user__is_staff=True)
         # Make sure 'oidcp' has an acceptable role
         RoleFactory(name_id='robot', person=oidcp, email=oidcp.email(), group__acronym='secretariat')
-        key = PersonalApiKey.objects.create(person=oidcp, endpoint=url)
+        key = PersonalApiKeyFactory(person=oidcp, endpoint=url)
         reg['apikey'] = key.hash()
         #
         # Test valid POST
@@ -827,7 +793,7 @@ class CustomApiTests(TestCase):
             'reg_type': 'onsite',
             'ticket_type': '',
             'checkedin': 'False',
-            'is_nomcom_volunteer': 'True',
+            'is_nomcom_volunteer': 'False',
         }
         person = PersonFactory()
         reg['email'] = person.email().address
@@ -841,16 +807,187 @@ class CustomApiTests(TestCase):
         # create appropriate group and nomcom objects
         nomcom = NomComFactory.create(is_accepting_volunteers=True, **nomcom_kwargs_for_year(year))
         url = urlreverse('ietf.api.views.api_new_meeting_registration')
-        r = self.client.post(url, reg)
-        self.assertContains(r, 'Invalid apikey', status_code=403)
         oidcp = PersonFactory(user__is_staff=True)
         # Make sure 'oidcp' has an acceptable role
         RoleFactory(name_id='robot', person=oidcp, email=oidcp.email(), group__acronym='secretariat')
-        key = PersonalApiKey.objects.create(person=oidcp, endpoint=url)
+        key = PersonalApiKeyFactory(person=oidcp, endpoint=url)
         reg['apikey'] = key.hash()
+
+        # first test is_nomcom_volunteer False
         r = self.client.post(url, reg)
-        nomcom = NomCom.objects.last()
         self.assertContains(r, "Accepted, New registration", status_code=202)
+        # assert no Volunteers exists
+        self.assertEqual(Volunteer.objects.count(), 0)
+
+        # test is_nomcom_volunteer True
+        reg['is_nomcom_volunteer'] = 'True'
+        r = self.client.post(url, reg)
+        self.assertContains(r, "Accepted, Updated registration", status_code=202)
+        # assert Volunteer exists
+        self.assertEqual(Volunteer.objects.count(), 1)
+        volunteer = Volunteer.objects.last()
+        self.assertEqual(volunteer.person, person)
+        self.assertEqual(volunteer.nomcom, nomcom)
+        self.assertEqual(volunteer.origin, 'registration')
+
+    @override_settings(APP_API_TOKENS={"ietf.api.views.api_new_meeting_registration_v2": ["valid-token"]})
+    def test_api_new_meeting_registration_v2(self):
+        meeting = MeetingFactory(type_id='ietf')
+        person = PersonFactory()
+        reg_detail = {
+            'email': person.email().address,
+            'first_name': person.first_name(),
+            'last_name': person.last_name(),
+            'meeting': meeting.number,
+            'affiliation': "Alguma Corporação",
+            'country_code': 'PT',
+            'checkedin': False,
+            'is_nomcom_volunteer': False,
+            'cancelled': False,
+            'tickets': [{'attendance_type': 'onsite', 'ticket_type': 'week_pass'}],
+        }
+        reg_data = {'objects': {reg_detail['email']: reg_detail}}
+        url = urlreverse('ietf.api.views.api_new_meeting_registration_v2')
+        #
+        # Test invalid key
+        r = self.client.post(url, data=json.dumps(reg_data), content_type='application/json', headers={"X-Api-Key": "invalid-token"})
+        self.assertEqual(r.status_code, 403)
+        #
+        # Test invalid data
+        bad_reg_data = copy.deepcopy(reg_data)
+        del bad_reg_data['objects'][reg_detail['email']]['email']
+        r = self.client.post(url, data=json.dumps(bad_reg_data), content_type='application/json', headers={"X-Api-Key": "valid-token"})
+        self.assertEqual(r.status_code, 400)
+        #
+        # Test valid POST
+        r = self.client.post(url, data=json.dumps(reg_data), content_type='application/json', headers={"X-Api-Key": "valid-token"})
+        self.assertContains(r, "Success", status_code=202)
+        #
+        # Check record
+        objects = Registration.objects.filter(email=reg_detail['email'], meeting__number=reg_detail['meeting'])
+        self.assertEqual(objects.count(), 1)
+        obj = objects[0]
+        for key in ['affiliation', 'country_code', 'first_name', 'last_name', 'checkedin']:
+            self.assertEqual(getattr(obj, key), False if key == 'checkedin' else reg_detail.get(key), f"Bad data for field {key}")
+        self.assertEqual(obj.tickets.count(), 1)
+        ticket = obj.tickets.first()
+        self.assertEqual(ticket.ticket_type.slug, reg_detail['tickets'][0]['ticket_type'])
+        self.assertEqual(ticket.attendance_type.slug, reg_detail['tickets'][0]['attendance_type'])
+        self.assertEqual(obj.person, person)
+        #
+        # Test update (switch to remote)
+        reg_detail = {
+            'affiliation': "Alguma Corporação",
+            'country_code': 'PT',
+            'email': person.email().address,
+            'first_name': person.first_name(),
+            'last_name': person.last_name(),
+            'meeting': meeting.number,
+            'checkedin': False,
+            'is_nomcom_volunteer': False,
+            'cancelled': False,
+            'tickets': [{'attendance_type': 'remote', 'ticket_type': 'week_pass'}],
+        }
+        reg_data = {'objects': {reg_detail['email']: reg_detail}}
+        r = self.client.post(url, data=json.dumps(reg_data), content_type='application/json', headers={"X-Api-Key": "valid-token"})
+        self.assertContains(r, "Success", status_code=202)
+        objects = Registration.objects.filter(email=reg_detail['email'], meeting__number=reg_detail['meeting'])
+        self.assertEqual(objects.count(), 1)
+        obj = objects[0]
+        self.assertEqual(obj.tickets.count(), 1)
+        ticket = obj.tickets.first()
+        self.assertEqual(ticket.ticket_type.slug, reg_detail['tickets'][0]['ticket_type'])
+        self.assertEqual(ticket.attendance_type.slug, reg_detail['tickets'][0]['attendance_type'])
+        #
+        # Test multiple
+        reg_detail = {
+            'affiliation': "Alguma Corporação",
+            'country_code': 'PT',
+            'email': person.email().address,
+            'first_name': person.first_name(),
+            'last_name': person.last_name(),
+            'meeting': meeting.number,
+            'checkedin': False,
+            'is_nomcom_volunteer': False,
+            'cancelled': False,
+            'tickets': [
+                {'attendance_type': 'onsite', 'ticket_type': 'one_day'},
+                {'attendance_type': 'remote', 'ticket_type': 'week_pass'},
+            ],
+        }
+        reg_data = {'objects': {reg_detail['email']: reg_detail}}
+        r = self.client.post(url, data=json.dumps(reg_data), content_type='application/json', headers={"X-Api-Key": "valid-token"})
+        self.assertContains(r, "Success", status_code=202)
+        objects = Registration.objects.filter(email=reg_detail['email'], meeting__number=reg_detail['meeting'])
+        self.assertEqual(objects.count(), 1)
+        obj = objects[0]
+        self.assertEqual(obj.tickets.count(), 2)
+        self.assertEqual(obj.tickets.filter(attendance_type__slug='onsite').count(), 1)
+        self.assertEqual(obj.tickets.filter(attendance_type__slug='remote').count(), 1)
+
+    @override_settings(APP_API_TOKENS={"ietf.api.views.api_new_meeting_registration_v2": ["valid-token"]})
+    def test_api_new_meeting_registration_v2_cancelled(self):
+        meeting = MeetingFactory(type_id='ietf')
+        person = PersonFactory()
+        reg_detail = {
+            'affiliation': "Acme",
+            'country_code': 'US',
+            'email': person.email().address,
+            'first_name': person.first_name(),
+            'last_name': person.last_name(),
+            'meeting': meeting.number,
+            'checkedin': False,
+            'is_nomcom_volunteer': False,
+            'cancelled': False,
+            'tickets': [{'attendance_type': 'onsite', 'ticket_type': 'week_pass'}],
+        }
+        reg_data = {'objects': {reg_detail['email']: reg_detail}}
+        url = urlreverse('ietf.api.views.api_new_meeting_registration_v2')
+        self.assertEqual(Registration.objects.count(), 0)
+        r = self.client.post(url, data=json.dumps(reg_data), content_type='application/json', headers={"X-Api-Key": "valid-token"})
+        self.assertContains(r, "Success", status_code=202)
+        self.assertEqual(Registration.objects.count(), 1)
+        reg_detail['cancelled'] = True
+        r = self.client.post(url, data=json.dumps(reg_data), content_type='application/json', headers={"X-Api-Key": "valid-token"})
+        self.assertContains(r, "Success", status_code=202)
+        self.assertEqual(Registration.objects.count(), 0)
+
+    @override_settings(APP_API_TOKENS={"ietf.api.views.api_new_meeting_registration_v2": ["valid-token"]})
+    def test_api_new_meeting_registration_v2_nomcom(self):
+        meeting = MeetingFactory(type_id='ietf')
+        person = PersonFactory()
+        reg_detail = {
+            'affiliation': "Acme",
+            'country_code': 'US',
+            'email': person.email().address,
+            'first_name': person.first_name(),
+            'last_name': person.last_name(),
+            'meeting': meeting.number,
+            'checkedin': False,
+            'is_nomcom_volunteer': False,
+            'cancelled': False,
+            'tickets': [{'attendance_type': 'onsite', 'ticket_type': 'week_pass'}],
+        }
+        reg_data = {'objects': {reg_detail['email']: reg_detail}}
+        url = urlreverse('ietf.api.views.api_new_meeting_registration_v2')
+        now = datetime.datetime.now()
+        if now.month > 10:
+            year = now.year + 1
+        else:
+            year = now.year
+        # create appropriate group and nomcom objects
+        nomcom = NomComFactory.create(is_accepting_volunteers=True, **nomcom_kwargs_for_year(year))
+
+        # first test is_nomcom_volunteer False
+        r = self.client.post(url, data=json.dumps(reg_data), content_type='application/json', headers={"X-Api-Key": "valid-token"})
+        self.assertContains(r, "Success", status_code=202)
+        # assert no Volunteers exists
+        self.assertEqual(Volunteer.objects.count(), 0)
+
+        # test is_nomcom_volunteer True
+        reg_detail['is_nomcom_volunteer'] = True
+        r = self.client.post(url, data=json.dumps(reg_data), content_type='application/json', headers={"X-Api-Key": "valid-token"})
+        self.assertContains(r, "Success", status_code=202)
         # assert Volunteer exists
         self.assertEqual(Volunteer.objects.count(), 1)
         volunteer = Volunteer.objects.last()
@@ -864,6 +1001,8 @@ class CustomApiTests(TestCase):
         r = self.client.get(url)
         data = r.json()
         self.assertEqual(data['version'], ietf.__version__+ietf.__patch__)
+        for lib in settings.ADVERTISE_VERSIONS:
+            self.assertIn(lib, data['other'])
         self.assertEqual(data['dumptime'], "2022-08-31 07:10:01 +0000")
         DumpInfo.objects.update(tz='PST8PDT')
         r = self.client.get(url)
@@ -872,28 +1011,38 @@ class CustomApiTests(TestCase):
 
 
     def test_api_appauth(self):
-        url = urlreverse('ietf.api.views.app_auth')
-        person = PersonFactory()
-        apikey = PersonalApiKey.objects.create(endpoint=url, person=person)
-
-        self.client.login(username=person.user.username,password=f'{person.user.username}+password')
-        self.client.logout()
-
-        # error cases
-        # missing apikey
-        r = self.client.post(url, {})
-        self.assertContains(r, 'Missing apikey parameter', status_code=400)
-
-        # invalid apikey
-        r = self.client.post(url, {'apikey': 'foobar'})
-        self.assertContains(r, 'Invalid apikey', status_code=403)
-
-        # working case
-        r = self.client.post(url, {'apikey': apikey.hash()})
-        self.assertEqual(r.status_code, 200)
-        jsondata = r.json()
-        self.assertEqual(jsondata['success'], True)
+        for app in ["authortools", "bibxml"]:
+            url = urlreverse('ietf.api.views.app_auth', kwargs={"app": app})
+            person = PersonFactory()
+            apikey = PersonalApiKeyFactory(endpoint=url, person=person)
     
+            self.client.login(username=person.user.username,password=f'{person.user.username}+password')
+            self.client.logout()
+    
+            # error cases
+            # missing apikey
+            r = self.client.post(url, {})
+            self.assertContains(r, 'Missing apikey parameter', status_code=400)
+    
+            # invalid apikey
+            r = self.client.post(url, {'apikey': 'foobar'})
+            self.assertContains(r, 'Invalid apikey', status_code=403)
+    
+            # working case
+            r = self.client.post(url, {'apikey': apikey.hash()})
+            self.assertEqual(r.status_code, 200)
+            jsondata = r.json()
+            self.assertEqual(jsondata['success'], True)
+            self.client.logout()
+
+    @override_settings(APP_API_TOKENS={"ietf.api.views.nfs_metrics": ["valid-token"]})
+    def test_api_nfs_metrics(self):
+        url = urlreverse("ietf.api.views.nfs_metrics")
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 403)
+        r = self.client.get(url, headers={"X-Api-Key": "valid-token"})
+        self.assertContains(r, 'nfs_latency_seconds{operation="write"}')
+
     def test_api_get_session_matherials_no_agenda_meeting_url(self):
         meeting = MeetingFactory(type_id='ietf')
         session = SessionFactory(meeting=meeting)
@@ -991,6 +1140,39 @@ class CustomApiTests(TestCase):
         self.assertCountEqual(result.keys(), ["addresses"])
         self.assertCountEqual(result["addresses"], Email.objects.filter(active=True).values_list("address", flat=True))
 
+    @override_settings(APP_API_TOKENS={"ietf.api.views.related_email_list": ["valid-token"]})
+    def test_related_email_list(self):
+        joe = EmailFactory(address='joe@work.com')
+        EmailFactory(address='joe@home.com', person=joe.person)
+        EmailFactory(address='jòe@spain.com', person=joe.person)
+        url = urlreverse("ietf.api.views.related_email_list", kwargs={'email': 'joe@home.com'})
+        # no api key
+        r = self.client.get(url, headers={})
+        self.assertEqual(r.status_code, 403)
+        # invalid api key
+        r = self.client.get(url, headers={"X-Api-Key": "not-the-valid-token"})
+        self.assertEqual(r.status_code, 403)
+        # wrong method
+        r = self.client.post(url, headers={"X-Api-Key": "valid-token"})
+        self.assertEqual(r.status_code, 405)
+        # valid
+        r = self.client.get(url, headers={"X-Api-Key": "valid-token"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        result = json.loads(r.content)
+        self.assertCountEqual(result.keys(), ["addresses"])
+        self.assertCountEqual(result["addresses"], joe.person.email_set.values_list("address", flat=True))
+        # non-ascii
+        non_ascii_url = urlreverse("ietf.api.views.related_email_list", kwargs={'email': 'jòe@spain.com'})
+        r = self.client.get(non_ascii_url, headers={"X-Api-Key": "valid-token"})
+        self.assertEqual(r.status_code, 200)
+        result = json.loads(r.content)
+        self.assertTrue('joe@home.com' in result["addresses"])
+        # email not found
+        not_found_url = urlreverse("ietf.api.views.related_email_list", kwargs={'email': 'nobody@nowhere.com'})
+        r = self.client.get(not_found_url, headers={"X-Api-Key": "valid-token"})
+        self.assertEqual(r.status_code, 404)
+
     @override_settings(APP_API_TOKENS={"ietf.api.views.role_holder_addresses": ["valid-token"]})
     def test_role_holder_addresses(self):
         url = urlreverse("ietf.api.views.role_holder_addresses")
@@ -1012,6 +1194,335 @@ class CustomApiTests(TestCase):
             content_dict["addresses"],
             sorted(e.address for e in emails),
         )
+
+    @override_settings(
+        APP_API_TOKENS={"ietf.api.views.ingest_email": "valid-token", "ietf.api.views.ingest_email_test": "test-token"}
+    )
+    @mock.patch("ietf.api.views.iana_ingest_review_email")
+    @mock.patch("ietf.api.views.ipr_ingest_response_email")
+    @mock.patch("ietf.api.views.nomcom_ingest_feedback_email")
+    def test_ingest_email(
+        self, mock_nomcom_ingest, mock_ipr_ingest, mock_iana_ingest
+    ):
+        mocks = {mock_nomcom_ingest, mock_ipr_ingest, mock_iana_ingest}
+        empty_outbox()        
+        url = urlreverse("ietf.api.views.ingest_email")
+        test_mode_url = urlreverse("ietf.api.views.ingest_email_test")
+
+        # test various bad calls
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 403)
+        self.assertFalse(any(m.called for m in mocks))
+        r = self.client.get(test_mode_url)
+        self.assertEqual(r.status_code, 403)
+        self.assertFalse(any(m.called for m in mocks))
+
+        r = self.client.post(url)
+        self.assertEqual(r.status_code, 403)
+        self.assertFalse(any(m.called for m in mocks))
+        r = self.client.post(test_mode_url)
+        self.assertEqual(r.status_code, 403)
+        self.assertFalse(any(m.called for m in mocks))
+
+        r = self.client.get(url, headers={"X-Api-Key": "valid-token"})
+        self.assertEqual(r.status_code, 405)
+        self.assertFalse(any(m.called for m in mocks))
+        r = self.client.get(test_mode_url, headers={"X-Api-Key": "test-token"})
+        self.assertEqual(r.status_code, 405)
+        self.assertFalse(any(m.called for m in mocks))
+
+        r = self.client.post(url, headers={"X-Api-Key": "valid-token"})
+        self.assertEqual(r.status_code, 415)
+        self.assertFalse(any(m.called for m in mocks))
+        r = self.client.post(test_mode_url, headers={"X-Api-Key": "test-token"})
+        self.assertEqual(r.status_code, 415)
+        self.assertFalse(any(m.called for m in mocks))
+
+        r = self.client.post(
+            url, content_type="application/json", headers={"X-Api-Key": "valid-token"}
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(any(m.called for m in mocks))
+        r = self.client.post(
+            test_mode_url, content_type="application/json", headers={"X-Api-Key": "test-token"}
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(any(m.called for m in mocks))
+
+        r = self.client.post(
+            url,
+            "this is not JSON!",
+            content_type="application/json",
+            headers={"X-Api-Key": "valid-token"},
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(any(m.called for m in mocks))
+        r = self.client.post(
+            test_mode_url,
+            "this is not JSON!",
+            content_type="application/json",
+            headers={"X-Api-Key": "test-token"},
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(any(m.called for m in mocks))
+
+        r = self.client.post(
+            url,
+            {"json": "yes", "valid_schema": False},
+            content_type="application/json",
+            headers={"X-Api-Key": "valid-token"},
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(any(m.called for m in mocks))
+        r = self.client.post(
+            test_mode_url,
+            {"json": "yes", "valid_schema": False},
+            content_type="application/json",
+            headers={"X-Api-Key": "test-token"},
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(any(m.called for m in mocks))
+
+        # bad destination
+        message_b64 = base64.b64encode(b"This is a message").decode()
+        r = self.client.post(
+            url,
+            {"dest": "not-a-destination", "message": message_b64},
+            content_type="application/json",
+            headers={"X-Api-Key": "valid-token"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        self.assertEqual(json.loads(r.content), {"result": "bad_dest"})
+        self.assertFalse(any(m.called for m in mocks))
+        r = self.client.post(
+            test_mode_url,
+            {"dest": "not-a-destination", "message": message_b64},
+            content_type="application/json",
+            headers={"X-Api-Key": "test-token"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        self.assertEqual(json.loads(r.content), {"result": "bad_dest"})
+        self.assertFalse(any(m.called for m in mocks))
+
+        # test that valid requests call handlers appropriately
+        r = self.client.post(
+            url,
+            {"dest": "iana-review", "message": message_b64},
+            content_type="application/json",
+            headers={"X-Api-Key": "valid-token"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        self.assertEqual(json.loads(r.content), {"result": "ok"})
+        self.assertTrue(mock_iana_ingest.called)
+        self.assertEqual(mock_iana_ingest.call_args, mock.call(b"This is a message"))
+        self.assertFalse(any(m.called for m in (mocks - {mock_iana_ingest})))
+        mock_iana_ingest.reset_mock()
+        
+        # the test mode endpoint should _not_ call the handler
+        r = self.client.post(
+            test_mode_url,
+            {"dest": "iana-review", "message": message_b64},
+            content_type="application/json",
+            headers={"X-Api-Key": "test-token"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        self.assertEqual(json.loads(r.content), {"result": "ok"})
+        self.assertFalse(any(m.called for m in mocks))
+        mock_iana_ingest.reset_mock()
+        
+        r = self.client.post(
+            url,
+            {"dest": "ipr-response", "message": message_b64},
+            content_type="application/json",
+            headers={"X-Api-Key": "valid-token"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        self.assertEqual(json.loads(r.content), {"result": "ok"})
+        self.assertTrue(mock_ipr_ingest.called)
+        self.assertEqual(mock_ipr_ingest.call_args, mock.call(b"This is a message"))
+        self.assertFalse(any(m.called for m in (mocks - {mock_ipr_ingest})))
+        mock_ipr_ingest.reset_mock()
+
+        # the test mode endpoint should _not_ call the handler
+        r = self.client.post(
+            test_mode_url,
+            {"dest": "ipr-response", "message": message_b64},
+            content_type="application/json",
+            headers={"X-Api-Key": "test-token"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        self.assertEqual(json.loads(r.content), {"result": "ok"})
+        self.assertFalse(any(m.called for m in mocks))
+        mock_ipr_ingest.reset_mock()
+
+        # bad nomcom-feedback dest
+        for bad_nomcom_dest in [
+            "nomcom-feedback",  # no suffix
+            "nomcom-feedback-",  # no year
+            "nomcom-feedback-squid",  # not a year,
+            "nomcom-feedback-2024-2025",  # also not a year
+        ]:
+            r = self.client.post(
+                url,
+                {"dest": bad_nomcom_dest, "message": message_b64},
+                content_type="application/json",
+                headers={"X-Api-Key": "valid-token"},
+            )
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.headers["Content-Type"], "application/json")
+            self.assertEqual(json.loads(r.content), {"result": "bad_dest"})
+            self.assertFalse(any(m.called for m in mocks))
+            r = self.client.post(
+                test_mode_url,
+                {"dest": bad_nomcom_dest, "message": message_b64},
+                content_type="application/json",
+                headers={"X-Api-Key": "test-token"},
+            )
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.headers["Content-Type"], "application/json")
+            self.assertEqual(json.loads(r.content), {"result": "bad_dest"})
+            self.assertFalse(any(m.called for m in mocks))
+
+        # good nomcom-feedback dest
+        random_year = randrange(100000)
+        r = self.client.post(
+            url,
+            {"dest": f"nomcom-feedback-{random_year}", "message": message_b64},
+            content_type="application/json",
+            headers={"X-Api-Key": "valid-token"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        self.assertEqual(json.loads(r.content), {"result": "ok"})
+        self.assertTrue(mock_nomcom_ingest.called)
+        self.assertEqual(mock_nomcom_ingest.call_args, mock.call(b"This is a message", random_year))
+        self.assertFalse(any(m.called for m in (mocks - {mock_nomcom_ingest})))
+        mock_nomcom_ingest.reset_mock()
+
+        # the test mode endpoint should _not_ call the handler
+        r = self.client.post(
+            test_mode_url,
+            {"dest": f"nomcom-feedback-{random_year}", "message": message_b64},
+            content_type="application/json",
+            headers={"X-Api-Key": "test-token"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        self.assertEqual(json.loads(r.content), {"result": "ok"})
+        self.assertFalse(any(m.called for m in mocks))
+        mock_nomcom_ingest.reset_mock()
+
+        # test that exceptions lead to email being sent - assumes that iana-review handling is representative
+        mock_iana_ingest.side_effect = EmailIngestionError("Error: don't send email")
+        r = self.client.post(
+            url,
+            {"dest": "iana-review", "message": message_b64},
+            content_type="application/json",
+            headers={"X-Api-Key": "valid-token"},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        self.assertEqual(json.loads(r.content), {"result": "bad_msg"})
+        self.assertTrue(mock_iana_ingest.called)
+        self.assertEqual(mock_iana_ingest.call_args, mock.call(b"This is a message"))
+        self.assertFalse(any(m.called for m in (mocks - {mock_iana_ingest})))
+        self.assertEqual(len(outbox), 0)  # implicitly tests that _none_ of the earlier tests sent email
+        mock_iana_ingest.reset_mock()
+
+        # test default recipients and attached original message
+        mock_iana_ingest.side_effect = EmailIngestionError(
+            "Error: do send email",
+            email_body="This is my email\n",
+            email_original_message=b"This is the original message"
+        )
+        with override_settings(ADMINS=[("Some Admin", "admin@example.com")]):
+            r = self.client.post(
+                url,
+                {"dest": "iana-review", "message": message_b64},
+                content_type="application/json",
+                headers={"X-Api-Key": "valid-token"},
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        self.assertEqual(json.loads(r.content), {"result": "bad_msg"})
+        self.assertTrue(mock_iana_ingest.called)
+        self.assertEqual(mock_iana_ingest.call_args, mock.call(b"This is a message"))
+        self.assertFalse(any(m.called for m in (mocks - {mock_iana_ingest})))
+        self.assertEqual(len(outbox), 1)
+        self.assertIn("admin@example.com", outbox[0]["To"])
+        self.assertEqual("Error: do send email", outbox[0]["Subject"])
+        self.assertEqual("This is my email\n", get_payload_text(outbox[0].get_body()))
+        attachments = list(a for a in outbox[0].iter_attachments())
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].get_filename(), "original-message")
+        self.assertEqual(attachments[0].get_content_type(), "application/octet-stream")
+        self.assertEqual(attachments[0].get_content(), b"This is the original message")
+        mock_iana_ingest.reset_mock()
+        empty_outbox()
+
+        # test overridden recipients and no attached original message
+        mock_iana_ingest.side_effect = EmailIngestionError(
+            "Error: do send email",
+            email_body="This is my email\n",
+            email_recipients=("thatguy@example.com")
+        )
+        with override_settings(ADMINS=[("Some Admin", "admin@example.com")]):
+            r = self.client.post(
+                url,
+                {"dest": "iana-review", "message": message_b64},
+                content_type="application/json",
+                headers={"X-Api-Key": "valid-token"},
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        self.assertEqual(json.loads(r.content), {"result": "bad_msg"})
+        self.assertTrue(mock_iana_ingest.called)
+        self.assertEqual(mock_iana_ingest.call_args, mock.call(b"This is a message"))
+        self.assertFalse(any(m.called for m in (mocks - {mock_iana_ingest})))
+        self.assertEqual(len(outbox), 1)
+        self.assertNotIn("admin@example.com", outbox[0]["To"])
+        self.assertIn("thatguy@example.com", outbox[0]["To"])
+        self.assertEqual("Error: do send email", outbox[0]["Subject"])
+        self.assertEqual("This is my email\n", get_payload_text(outbox[0]))
+        mock_iana_ingest.reset_mock()
+        empty_outbox()
+
+        # test attached traceback
+        mock_iana_ingest.side_effect = EmailIngestionError(
+            "Error: do send email",
+            email_body="This is my email\n",
+            email_attach_traceback=True,
+        )
+        with override_settings(ADMINS=[("Some Admin", "admin@example.com")]):
+            r = self.client.post(
+                url,
+                {"dest": "iana-review", "message": message_b64},
+                content_type="application/json",
+                headers={"X-Api-Key": "valid-token"},
+            )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers["Content-Type"], "application/json")
+        self.assertEqual(json.loads(r.content), {"result": "bad_msg"})
+        self.assertTrue(mock_iana_ingest.called)
+        self.assertEqual(mock_iana_ingest.call_args, mock.call(b"This is a message"))
+        self.assertFalse(any(m.called for m in (mocks - {mock_iana_ingest})))
+        self.assertEqual(len(outbox), 1)
+        self.assertIn("admin@example.com", outbox[0]["To"])
+        self.assertEqual("Error: do send email", outbox[0]["Subject"])
+        self.assertEqual("This is my email\n", get_payload_text(outbox[0].get_body()))
+        attachments = list(a for a in outbox[0].iter_attachments())
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].get_filename(), "traceback.txt")
+        self.assertEqual(attachments[0].get_content_type(), "text/plain")
+        self.assertIn("ietf.api.views.EmailIngestionError: Error: do send email", attachments[0].get_content())
+        mock_iana_ingest.reset_mock()
+        empty_outbox()
 
 
 class DirectAuthApiTests(TestCase):
@@ -1129,7 +1640,7 @@ class TastypieApiTestCase(ResourceTestCaseMixin, TestCase):
         resource_list = r.json()
 
         for name in self.apps:
-            if not name in self.apps:
+            if not name in resource_list:
                 sys.stderr.write("Expected a REST API resource for %s, but didn't find one\n" % name)
 
         for name in self.apps:

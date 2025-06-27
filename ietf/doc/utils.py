@@ -1,11 +1,9 @@
-# Copyright The IETF Trust 2011-2020, All Rights Reserved
+# Copyright The IETF Trust 2011-2024, All Rights Reserved
 # -*- coding: utf-8 -*-
 
 
 import datetime
-import hashlib
 import io
-import json
 import math
 import os
 import re
@@ -13,11 +11,15 @@ import textwrap
 
 from collections import defaultdict, namedtuple, Counter
 from dataclasses import dataclass
-from typing import Iterator, Union
+from hashlib import sha384
+from pathlib import Path
+from typing import Iterator, Optional, Union
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.contrib import messages
+from django.core.cache import caches
+from django.db.models import OuterRef
 from django.forms import ValidationError
 from django.http import Http404
 from django.template.loader import render_to_string
@@ -38,7 +40,7 @@ from ietf.doc.models import TelechatDocEvent, DocumentActionHolder, EditedAuthor
 from ietf.name.models import DocReminderTypeName, DocRelationshipName
 from ietf.group.models import Role, Group, GroupFeatures
 from ietf.ietfauth.utils import has_role, is_authorized_in_doc_stream, is_individual_draft_author, is_bofreq_editor
-from ietf.person.models import Person
+from ietf.person.models import Email, Person
 from ietf.review.models import ReviewWish
 from ietf.utils import draft, log
 from ietf.utils.mail import parseaddr, send_mail
@@ -346,6 +348,7 @@ def augment_events_with_revision(doc, events):
     """Take a set of events for doc and add a .rev attribute with the
     revision they refer to by checking NewRevisionDocEvents."""
 
+    # Need QuerySetAny instead of QuerySet until django-stubs 5.0.1
     if isinstance(events, QuerySetAny):
         qs = events.filter(newrevisiondocevent__isnull=False)
     else:
@@ -396,8 +399,12 @@ def get_unicode_document_content(key, filename, codec='utf-8', errors='ignore'):
 def tags_suffix(tags):
     return ("::" + "::".join(t.name for t in tags)) if tags else ""
 
-def add_state_change_event(doc, by, prev_state, new_state, prev_tags=None, new_tags=None, timestamp=None):
-    """Add doc event to explain that state change just happened."""
+
+def new_state_change_event(doc, by, prev_state, new_state, prev_tags=None, new_tags=None, timestamp=None):
+    """Create unsaved doc event to explain that state change just happened
+    
+    Returns None if no state change occurred.
+    """
     if prev_state and new_state:
         assert prev_state.type_id == new_state.type_id
 
@@ -417,7 +424,22 @@ def add_state_change_event(doc, by, prev_state, new_state, prev_tags=None, new_t
         e.desc += " from %s" % (prev_state.name + tags_suffix(prev_tags))
     if timestamp:
         e.time = timestamp
-    e.save()
+    return e  # not saved!
+
+
+def add_state_change_event(doc, by, prev_state, new_state, prev_tags=None, new_tags=None, timestamp=None):
+    """Add doc event to explain that state change just happened.
+    
+    Returns None if no state change occurred.
+    
+    Note: Creating a state change DocEvent will trigger notifications to be sent to people subscribed
+    to the doc via a CommunityList on its first save(). If you need to adjust the event (say, changing
+    its desc) before that notification is sent, use new_state_change_event() instead and save the
+    event after making your changes. 
+    """
+    e = new_state_change_event(doc, by, prev_state, new_state, prev_tags, new_tags, timestamp)
+    if e is not None:
+        e.save()
     return e
 
 
@@ -471,8 +493,9 @@ def update_action_holders(doc, prev_state=None, new_state=None, prev_tags=None, 
     
     Returns an event describing the change which should be passed to doc.save_with_history()
     
-    Only cares about draft-iesg state changes. Places where other state types are updated
-    may not call this method. If you add rules for updating action holders on other state
+    Only cares about draft-iesg state changes and draft expiration. 
+    Places where other state types are updated may not call this method. 
+    If you add rules for updating action holders on other state
     types, be sure this is called in the places that change that state.
     """
     # Should not call this with different state types
@@ -491,41 +514,50 @@ def update_action_holders(doc, prev_state=None, new_state=None, prev_tags=None, 
     
     # Remember original list of action holders to later check if it changed
     prev_set = list(doc.action_holders.all())
-    
-    # Update the action holders. To get this right for people with more
-    # than one relationship to the document, do removals first, then adds.
-    # Remove outdated action holders
-    iesg_state_changed = (prev_state != new_state) and (getattr(new_state, "type_id", None) == "draft-iesg") 
-    if iesg_state_changed:
-        # Clear the action_holders list on a state change. This will reset the age of any that get added back.
+
+    if new_state and new_state.type_id=="draft" and new_state.slug=="expired":
         doc.action_holders.clear()
-    if tags.removed("need-rev"):
-        # Removed the 'need-rev' tag - drop authors from the action holders list
-        DocumentActionHolder.objects.filter(document=doc, person__in=doc.authors()).delete()
-    elif tags.added("need-rev"):
-        # Remove the AD if we're asking for a new revision
-        DocumentActionHolder.objects.filter(document=doc, person=doc.ad).delete()
+        return add_action_holder_change_event(
+            doc, 
+            Person.objects.get(name='(System)'), 
+            prev_set,
+            reason='draft expired',
+        )
+    else:
+        # Update the action holders. To get this right for people with more
+        # than one relationship to the document, do removals first, then adds.
+        # Remove outdated action holders
+        iesg_state_changed = (prev_state != new_state) and (getattr(new_state, "type_id", None) == "draft-iesg") 
+        if iesg_state_changed:
+            # Clear the action_holders list on a state change. This will reset the age of any that get added back.
+            doc.action_holders.clear()
+        if tags.removed("need-rev"):
+            # Removed the 'need-rev' tag - drop authors from the action holders list
+            DocumentActionHolder.objects.filter(document=doc, person__in=doc.authors()).delete()
+        elif tags.added("need-rev"):
+            # Remove the AD if we're asking for a new revision
+            DocumentActionHolder.objects.filter(document=doc, person=doc.ad).delete()
 
-    # Add new action holders
-    if doc.ad:
-        # AD is an action holder unless specified otherwise for the new state
-        if iesg_state_changed and new_state.slug not in DocumentActionHolder.CLEAR_ACTION_HOLDERS_STATES:
-            doc.action_holders.add(doc.ad)
-        # If AD follow-up is needed, make sure they are an action holder 
-        if tags.added("ad-f-up"):
-            doc.action_holders.add(doc.ad)
-    # Authors get the action if a revision is needed
-    if tags.added("need-rev"):
-        for auth in doc.authors():
-            doc.action_holders.add(auth)
+        # Add new action holders
+        if doc.ad:
+            # AD is an action holder unless specified otherwise for the new state
+            if iesg_state_changed and new_state.slug not in DocumentActionHolder.CLEAR_ACTION_HOLDERS_STATES:
+                doc.action_holders.add(doc.ad)
+            # If AD follow-up is needed, make sure they are an action holder 
+            if tags.added("ad-f-up"):
+                doc.action_holders.add(doc.ad)
+        # Authors get the action if a revision is needed
+        if tags.added("need-rev"):
+            for auth in doc.authors():
+                doc.action_holders.add(auth)
 
-    # Now create an event if we changed the set
-    return add_action_holder_change_event(
-        doc, 
-        Person.objects.get(name='(System)'), 
-        prev_set,
-        reason='IESG state changed',
-    )
+        # Now create an event if we changed the set
+        return add_action_holder_change_event(
+            doc, 
+            Person.objects.get(name='(System)'), 
+            prev_set,
+            reason='IESG state changed',
+        )
 
 
 def update_documentauthors(doc, new_docauthors, by=None, basis=None):
@@ -739,7 +771,7 @@ def update_telechat(request, doc, by, new_telechat_date, new_returning_item=None
         else:
             e.desc = "Removed from agenda for telechat"
     elif on_agenda and new_telechat_date != prev_telechat:
-        e.desc = "Telechat date has been changed to <b>%s</b> from <b>%s</b>" % (
+        e.desc = "Telechat date has been changed to <b>%s</b> (Previous date was <b>%s</b>)" % (
             new_telechat_date, prev_telechat)
     else:
         # we didn't reschedule but flipped returning item bit - let's
@@ -1026,14 +1058,6 @@ def make_rev_history(doc):
     return sorted(history, key=lambda x: x['published'])
 
 
-def get_search_cache_key(params):
-    from ietf.doc.views_search import SearchForm
-    fields = set(SearchForm.base_fields) - set(['sort',])
-    kwargs = dict([ (k,v) for (k,v) in list(params.items()) if k in fields ])
-    key = "doc:document:search:" + hashlib.sha512(json.dumps(kwargs, sort_keys=True).encode('utf-8')).hexdigest()
-    return key
-
-
 def build_file_urls(doc: Union[Document, DocHistory]):
     if doc.type_id == "rfc":
         base_path = os.path.join(settings.RFC_PATH, doc.name + ".")
@@ -1044,6 +1068,8 @@ def build_file_urls(doc: Union[Document, DocHistory]):
 
         file_urls = []
         for t in found_types:
+            if t == "ps": # Postscript might have been submitted but should not be displayed in the list of URLs
+                continue
             label = "plain text" if t == "txt" else t
             file_urls.append((label, base + doc.name + "." + t))
 
@@ -1067,7 +1093,7 @@ def build_file_urls(doc: Union[Document, DocHistory]):
             label = "plain text" if t == "txt" else t
             file_urls.append((label, base + doc.name + "-" + doc.rev + "." + t))
 
-        if doc.text():
+        if doc.text_exists():
             file_urls.append(("htmlized", urlreverse('ietf.doc.views_doc.document_html', kwargs=dict(name=doc.name, rev=doc.rev))))
             file_urls.append(("pdfized", urlreverse('ietf.doc.views_doc.document_pdfized', kwargs=dict(name=doc.name, rev=doc.rev))))
         file_urls.append(("bibtex", urlreverse('ietf.doc.views_doc.document_bibtex',kwargs=dict(name=doc.name,rev=doc.rev))))
@@ -1226,6 +1252,7 @@ def fuzzy_find_documents(name, rev=None):
     FoundDocuments = namedtuple('FoundDocuments', 'documents matched_name matched_rev')
     return FoundDocuments(docs, name, rev)
 
+
 def bibxml_for_draft(doc, rev=None):
 
     if rev is not None and rev != doc.rev:
@@ -1264,6 +1291,12 @@ def bibxml_for_draft(doc, rev=None):
 class DraftAliasGenerator:
     days = 2 * 365
 
+    def __init__(self, draft_queryset=None):
+        if draft_queryset is not None:
+            self.draft_queryset = draft_queryset.filter(type_id="draft")  # only drafts allowed
+        else:
+            self.draft_queryset = Document.objects.filter(type_id="draft")
+
     def get_draft_ad_emails(self, doc):
         """Get AD email addresses for the given draft, if any."""
         from ietf.group.utils import get_group_ad_emails  # avoid circular import
@@ -1294,9 +1327,13 @@ class DraftAliasGenerator:
     def get_draft_authors_emails(self, doc):
         """Get list of authors for the given draft."""
         author_emails = set()
-        for author in doc.documentauthor_set.all():
-            if author.email and author.email.email_address():
-                author_emails.add(author.email.email_address())
+        for email in Email.objects.filter(documentauthor__document=doc):
+            if email.active:
+                author_emails.add(email.address)
+            elif email.person:
+                person_email = email.person.email_address()
+                if person_email:
+                    author_emails.add(person_email)
         return author_emails
 
     def get_draft_notify_emails(self, doc):
@@ -1329,56 +1366,152 @@ class DraftAliasGenerator:
                     notify_emails.add(email)
         return notify_emails
 
+    def _yield_aliases_for_draft(self, doc)-> Iterator[tuple[str, list[str]]]:
+        alias = doc.name
+        all = set()
+
+        # no suffix and .authors are the same list
+        emails = self.get_draft_authors_emails(doc)
+        all.update(emails)
+        if emails:
+            yield alias, list(emails)
+            yield alias + ".authors", list(emails)
+
+        # .chairs = group chairs
+        emails = self.get_draft_chair_emails(doc)
+        if emails:
+            all.update(emails)
+            yield alias + ".chairs", list(emails)
+
+        # .ad = sponsoring AD / WG AD (WG document)
+        emails = self.get_draft_ad_emails(doc)
+        if emails:
+            all.update(emails)
+            yield alias + ".ad", list(emails)
+
+        # .notify = notify email list from the Document
+        emails = self.get_draft_notify_emails(doc)
+        if emails:
+            all.update(emails)
+            yield alias + ".notify", list(emails)
+
+        # .shepherd = shepherd email from the Document
+        emails = self.get_draft_shepherd_email(doc)
+        if emails:
+            all.update(emails)
+            yield alias + ".shepherd", list(emails)
+
+        # .all = everything from above
+        if all:
+            yield alias + ".all", list(all)
+
     def __iter__(self) -> Iterator[tuple[str, list[str]]]:
         # Internet-Drafts with active status or expired within self.days
         show_since = timezone.now() - datetime.timedelta(days=self.days)
-        drafts = Document.objects.filter(type_id="draft")
-        active_drafts = drafts.filter(states__slug='active')
-        inactive_recent_drafts = drafts.exclude(states__slug='active').filter(expires__gte=show_since)
-        interesting_drafts = active_drafts | inactive_recent_drafts
+        drafts = self.draft_queryset
 
-        for this_draft in interesting_drafts.distinct().iterator():
+        # Look up the draft-active state properly. Doing this with
+        # states__type_id, states__slug directly in the `filter()`
+        # works, but it does not work as expected in `exclude()`.
+        active_state = State.objects.get(type_id="draft", slug="active")
+        active_pks = []  # build a static list of the drafts we actually returned as "active"
+        active_drafts = drafts.filter(states=active_state)
+        for this_draft in active_drafts:
+            active_pks.append(this_draft.pk)
+            for alias, addresses in self._yield_aliases_for_draft(this_draft):
+                yield alias, addresses
+
+        # Annotate with the draft state slug so we can check for drafts that
+        # have become RFCs
+        inactive_recent_drafts = (
+            drafts.exclude(pk__in=active_pks)  # don't re-filter by state, states may have changed during the run!
+            .filter(expires__gte=show_since)
+            .annotate(
+                # Why _default_manager instead of objects? See:
+                # https://docs.djangoproject.com/en/4.2/topics/db/managers/#django.db.models.Model._default_manager
+                draft_state_slug=Document.states.through._default_manager.filter(
+                    document__pk=OuterRef("pk"),
+                    state__type_id="draft"
+                ).values("state__slug"),
+            )
+        )
+        for this_draft in inactive_recent_drafts:
             # Omit drafts that became RFCs, unless they were published in the last DEFAULT_YEARS
-            if this_draft.get_state_slug() == "rfc":
+            if this_draft.draft_state_slug == "rfc":
                 rfc = this_draft.became_rfc()
                 log.assertion("rfc is not None")
                 if rfc.latest_event(type='published_rfc').time < show_since:
                     continue
+            for alias, addresses in self._yield_aliases_for_draft(this_draft):
+                yield alias, addresses
 
-            alias = this_draft.name
-            all = set()
 
-            # no suffix and .authors are the same list
-            emails = self.get_draft_authors_emails(this_draft)
-            all.update(emails)
-            if emails:
-                yield alias, list(emails)
-                yield alias + ".authors", list(emails)
+def get_doc_email_aliases(name: Optional[str] = None):
+    aliases = []
+    for (alias, alist) in DraftAliasGenerator(
+        Document.objects.filter(type_id="draft", name=name) if name else None
+    ):
+        # alias is draft-name.alias_type
+        doc_name, _dot, alias_type = alias.partition(".")
+        aliases.append({
+            "doc_name": doc_name,
+            "alias_type": f".{alias_type}" if alias_type else "",
+            "expansion": ", ".join(sorted(alist)),
+        })
+    return sorted(aliases, key=lambda a: (a["doc_name"]))
 
-            # .chairs = group chairs
-            emails = self.get_draft_chair_emails(this_draft)
-            if emails:
-                all.update(emails)
-                yield alias + ".chairs", list(emails)
 
-            # .ad = sponsoring AD / WG AD (WG document)
-            emails = self.get_draft_ad_emails(this_draft)
-            if emails:
-                all.update(emails)
-                yield alias + ".ad", list(emails)
+def investigate_fragment(name_fragment: str):
+    cache = caches["default"]
+    # Ensure name_fragment does not interact badly with the cache key handling
+    name_digest = sha384(name_fragment.encode("utf8")).hexdigest()
+    cache_key = f"investigate_fragment:{name_digest}"
+    result = cache.get(cache_key)
+    if result is None:
+        can_verify = set()
+        for root in [settings.INTERNET_DRAFT_PATH, settings.INTERNET_DRAFT_ARCHIVE_DIR]:
+            can_verify.update(list(Path(root).glob(f"*{name_fragment}*")))
+        archive_verifiable_names = set([p.name for p in can_verify])
+        # Can also verify drafts in proceedings directories
+        can_verify.update(list(Path(settings.AGENDA_PATH).glob(f"**/*{name_fragment}*")))
+    
+        # N.B. This reflects the assumption that the internet draft archive dir is in the
+        # a directory with other collections (at /a/ietfdata/draft/collections as this is written)
+        unverifiable_collections = set([
+            p for p in
+            Path(settings.INTERNET_DRAFT_ARCHIVE_DIR).parent.glob(f"**/*{name_fragment}*")
+            if p.name not in archive_verifiable_names
+        ])
+        
+        unverifiable_collections.difference_update(can_verify)
+    
+        expected_names = set([p.name for p in can_verify.union(unverifiable_collections)])
+        maybe_unexpected = list(
+            Path(settings.INTERNET_ALL_DRAFTS_ARCHIVE_DIR).glob(f"*{name_fragment}*")
+        )
+        unexpected = [p for p in maybe_unexpected if p.name not in expected_names]
+        result = dict(
+            can_verify=can_verify,
+            unverifiable_collections=unverifiable_collections,
+            unexpected=unexpected,
+        )
+        # 1 hour caching
+        cache.set(key=cache_key, timeout=3600, value=result)
+    return result
 
-            # .notify = notify email list from the Document
-            emails = self.get_draft_notify_emails(this_draft)
-            if emails:
-                all.update(emails)
-                yield alias + ".notify", list(emails)
 
-            # .shepherd = shepherd email from the Document
-            emails = self.get_draft_shepherd_email(this_draft)
-            if emails:
-                all.update(emails)
-                yield alias + ".shepherd", list(emails)
+def update_or_create_draft_bibxml_file(doc, rev):
+    log.assertion("doc.type_id == 'draft'")
+    normalized_bibxml = re.sub(r"\r\n?", r"\n", bibxml_for_draft(doc, rev))
+    ref_rev_file_path = Path(settings.BIBXML_BASE_PATH) / "bibxml-ids" / f"reference.I-D.{doc.name}-{rev}.xml"
+    try:
+        existing_bibxml = ref_rev_file_path.read_text(encoding="utf8")
+    except IOError:
+        existing_bibxml = ""
+    if normalized_bibxml.strip() != existing_bibxml.strip():
+        log.log(f"Writing {ref_rev_file_path}")
+        ref_rev_file_path.write_text(normalized_bibxml, encoding="utf8") # TODO-BLOBSTORE
 
-            # .all = everything from above
-            if all:
-                yield alias + ".all", list(all)
+
+def ensure_draft_bibxml_path_exists():
+    (Path(settings.BIBXML_BASE_PATH) / "bibxml-ids").mkdir(exist_ok=True)

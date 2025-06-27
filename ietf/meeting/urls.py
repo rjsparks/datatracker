@@ -16,13 +16,13 @@ class AgendaRedirectView(RedirectView):
 safe_for_all_meeting_types = [
     url(r'^session/(?P<acronym>[-a-z0-9]+)/?$',  views.session_details),
     url(r'^session/(?P<session_id>\d+)/drafts$',  views.add_session_drafts),
+    url(r'^session/(?P<session_id>\d+)/recordings$', views.add_session_recordings),
     url(r'^session/(?P<session_id>\d+)/attendance$', views.session_attendance),
     url(r'^session/(?P<session_id>\d+)/bluesheets$', views.upload_session_bluesheets),
     url(r'^session/(?P<session_id>\d+)/minutes$', views.upload_session_minutes),
     url(r'^session/(?P<session_id>\d+)/narrativeminutes$', views.upload_session_narrativeminutes),
     url(r'^session/(?P<session_id>\d+)/agenda$', views.upload_session_agenda),
     url(r'^session/(?P<session_id>\d+)/import/minutes$', views.import_session_minutes),
-    url(r'^session/(?P<session_id>\d+)/propose_slides$', views.propose_session_slides),
     url(r'^session/(?P<session_id>\d+)/slides(?:/%(name)s)?$' % settings.URL_REGEXPS, views.upload_session_slides),
     url(r'^session/(?P<session_id>\d+)/add_to_session$', views.ajax_add_slides_to_session),
     url(r'^session/(?P<session_id>\d+)/remove_from_session$', views.ajax_remove_slides_from_session),
@@ -64,7 +64,8 @@ type_ietf_only_patterns = [
 type_interim_patterns = [
     url(r'^agenda/(?P<acronym>[A-Za-z0-9-]+)-drafts.pdf$', views.session_draft_pdf),
     url(r'^agenda/(?P<acronym>[A-Za-z0-9-]+)-drafts.tgz$', views.session_draft_tarfile),
-    url(r'^materials/%(document)s((?P<ext>\.[a-z0-9]+)|/)?$' % settings.URL_REGEXPS, views.materials_document),
+    url(r'^materials/%(document)s(?P<ext>\.[a-z0-9]+)$' % settings.URL_REGEXPS, views.materials_document),
+    url(r'^materials/%(document)s/?$' % settings.URL_REGEXPS, views.materials_document),
     url(r'^agenda.json$', views.agenda_json)
 ]
 
@@ -84,7 +85,7 @@ type_ietf_only_patterns_id_optional = [
     url(r'^week-view(?:.html)?/?$', AgendaRedirectView.as_view(pattern_name='agenda', permanent=True)),
     url(r'^materials(?:.html)?/?$', views.materials),
     url(r'^request_minutes/?$', views.request_minutes),
-    url(r'^materials/%(document)s((?P<ext>\.[a-z0-9]+)|/)?$' % settings.URL_REGEXPS, views.materials_document),
+    url(r'^materials/%(document)s(?P<ext>\.[a-z0-9]+)?/?$' % settings.URL_REGEXPS, views.materials_document),
     url(r'^session/?$', views.materials_editable_groups),
     url(r'^proceedings(?:.html)?/?$', views.proceedings),
     url(r'^proceedings(?:.html)?/finalize/?$', views.finalize_proceedings),

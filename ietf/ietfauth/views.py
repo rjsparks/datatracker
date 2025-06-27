@@ -38,14 +38,14 @@ import datetime
 import importlib
 
 # needed if we revert to higher barrier for account creation
-#from datetime import datetime as DateTime, timedelta as TimeDelta, date as Date
+# from datetime import datetime as DateTime, timedelta as TimeDelta, date as Date
 from collections import defaultdict
 
 import django.core.signing
 from django import forms
 from django.contrib import messages
 from django.conf import settings
-from django.contrib.auth import update_session_auth_hash, logout, authenticate
+from django.contrib.auth import logout, update_session_auth_hash, password_validation
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm
 from django.contrib.auth.hashers import identify_hasher
@@ -65,8 +65,7 @@ from ietf.group.models import Role, Group
 from ietf.ietfauth.forms import ( RegistrationForm, PasswordForm, ResetPasswordForm, TestEmailForm,
                                 ChangePasswordForm, get_person_form, RoleEmailForm,
                                 NewEmailForm, ChangeUsernameForm, PersonPasswordForm)
-from ietf.ietfauth.htpasswd import update_htpasswd_file
-from ietf.ietfauth.utils import has_role
+from ietf.ietfauth.utils import has_role, send_new_email_confirmation_request
 from ietf.name.models import ExtResourceName
 from ietf.nomcom.models import NomCom
 from ietf.person.models import Person, Email, Alias, PersonalApiKey, PERSON_API_KEY_VALUES
@@ -79,7 +78,6 @@ from ietf.utils.validators import validate_external_resource_value
 from ietf.utils.timezone import date_today, DEADLINE_TZINFO
 
 # These are needed if we revert to the higher bar for account creation
-
 
 
 def index(request):
@@ -98,7 +96,7 @@ def index(request):
 # def ietf_login(request):
 #     if not request.user.is_authenticated:
 #         return HttpResponse("Not authenticated?", status=500)
-# 
+#
 #     redirect_to = request.REQUEST.get(REDIRECT_FIELD_NAME, '')
 #     request.session.set_test_cookie()
 #     return HttpResponseRedirect('/accounts/loggedin/?%s=%s' % (REDIRECT_FIELD_NAME, urlquote(redirect_to)))
@@ -222,8 +220,6 @@ def confirm_account(request, auth):
             user = User.objects.create(username=email, email=email)
             user.set_password(password)
             user.save()
-            # password is also stored in htpasswd file
-            update_htpasswd_file(email, password)
 
             # make sure the rest of the person infrastructure is
             # well-connected
@@ -300,31 +296,8 @@ def profile(request):
                 to_email = f.cleaned_data["new_email"]
                 if not to_email:
                     continue
-
                 email_confirmations.append(to_email)
-
-                auth = django.core.signing.dumps([person.user.username, to_email], salt="add_email")
-
-                domain = Site.objects.get_current().domain
-                from_email = settings.DEFAULT_FROM_EMAIL
-
-                existing = Email.objects.filter(address=to_email).first()
-                if existing:
-                    subject = 'Attempt to add your email address by %s' % person.name
-                    send_mail(request, to_email, from_email, subject, 'registration/add_email_exists_email.txt', {
-                        'domain': domain,
-                        'email': to_email,
-                        'person': person,
-                    })
-                else:
-                    subject = 'Confirm email address for %s' % person.name
-                    send_mail(request, to_email, from_email, subject, 'registration/add_email_email.txt', {
-                        'domain': domain,
-                        'auth': auth,
-                        'email': to_email,
-                        'person': person,
-                        'expire': settings.DAYS_TO_EXPIRE_REGISTRATION_LINK,
-                    })
+                send_new_email_confirmation_request(person, to_email)
 
             for r in roles:
                 e = r.email_form.cleaned_data["email"]
@@ -494,9 +467,19 @@ def password_reset(request):
             if not user:
                 # try to find user ID from the email address
                 email = Email.objects.filter(address=submitted_username).first()
-                if email and email.person and email.person.user:
-                    user = email.person.user
-
+                if email and email.person:
+                    if email.person.user:
+                        user = email.person.user
+                    else: 
+                        # Create a User record with this (conditioned by way of Email) username
+                        # Don't bother setting the name or email fields on User - rely on the
+                        # Person pointer.
+                        user = User.objects.create(
+                            username=email.address.lower(), 
+                            is_active=True,
+                        )
+                        email.person.user = user
+                        email.person.save()
             if user and user.person.email_set.filter(active=True).exists():
                 data = {
                     'username': user.username,
@@ -552,8 +535,6 @@ def confirm_password_reset(request, auth):
 
             user.set_password(password)
             user.save()
-            # password is also stored in htpasswd file
-            update_htpasswd_file(user.username, password)
 
             success = True
     else:
@@ -598,7 +579,6 @@ def test_email(request):
         r.set_cookie("testmailcc", cookie)
 
     return r
-
 
 
 class AddReviewWishForm(forms.Form):
@@ -693,8 +673,6 @@ def change_password(request):
             
             user.set_password(new_password)
             user.save()
-            # password is also stored in htpasswd file
-            update_htpasswd_file(user.username, new_password)
             # keep the session
             update_session_auth_hash(request, user)
 
@@ -716,7 +694,7 @@ def change_password(request):
         'hasher': hasher,
     })
 
-    
+
 @login_required
 @person_required
 def change_username(request):
@@ -731,13 +709,10 @@ def change_username(request):
         form = ChangeUsernameForm(user, request.POST)
         if form.is_valid():
             new_username = form.cleaned_data["username"]
-            password = form.cleaned_data["password"]
             assert new_username in emails
 
             user.username = new_username.lower()
             user.save()
-            # password is also stored in htpasswd file
-            update_htpasswd_file(user.username, password)
             # keep the session
             update_session_auth_hash(request, user)
 
@@ -752,53 +727,79 @@ def change_username(request):
     return render(request, 'registration/change_username.html', {'form': form})
 
 
-
-def login(request, extra_context=None):
+class AnyEmailAuthenticationForm(AuthenticationForm):
+    """AuthenticationForm that allows any email address as the username
+    
+    Also performs a check for a cleared password field and provides a helpful error message
+    if that applies to the user attempting to log in.
     """
-    This login function is a wrapper around django's login() for the purpose
-    of providing a notification if the user's password has been cleared.  The
-    warning will be triggered if the password field has been set to something
-    which is not recognized as a valid password hash.
-    """
+    _unauthenticated_user = None
 
-    if request.method == "POST":
-        form = AuthenticationForm(request, data=request.POST)
-        username = form.data.get('username')
-        user = User.objects.filter(username__iexact=username).first() # Consider _never_ actually looking for the User username and only looking at Email
-        if not user:
-            # try to find user ID from the email address
+    def clean_username(self):
+        username = self.cleaned_data.get("username", None)
+        if username is None:
+            raise self.get_invalid_login_error()
+        user = User.objects.filter(username__iexact=username).first()
+        if user is None:
             email = Email.objects.filter(address=username).first()
-            if email and email.person and email.person.user:
-                u2 = email.person.user
-                # be conservative, only accept this if login is valid
-                if u2:
-                    pw = form.data.get('password')
-                    au = authenticate(request, username=u2.username, password=pw)
-                    if au:
-                        # kludge to change the querydict
-                        q2 = request.POST.copy()
-                        q2['username'] = u2.username
-                        request.POST = q2
-                        user = u2
-        #
-        if user:
-            try:
-                identify_hasher(user.password)
+            if email and email.person:
+                user = email.person.user  # might be None
+        if user is None:
+            raise self.get_invalid_login_error()
+        self._unauthenticated_user = user  # remember this for the clean() method
+        return user.username
+
+    def clean(self):
+        if self._unauthenticated_user is not None:
+            try: 
+                identify_hasher(self._unauthenticated_user.password)
             except ValueError:
-                extra_context = {"alert":
-                                    "Note: Your password has been cleared because "
-                                    "of possible password leakage.  "
-                                    "Please use the password reset link below "
-                                    "to set a new password for your account.",
-                                }
-    response = LoginView.as_view(extra_context=extra_context)(request)
-    if isinstance(response, HttpResponseRedirect) and user and user.is_authenticated:
-        try:
-            user.person
-        except Person.DoesNotExist:
-            logout(request)
-            response = render(request, 'registration/missing_person.html')
-    return response
+                self.add_error(
+                    "password",
+                    'Your password has been cleared because of possible password leakage. '
+                    'Please use the "Forgot your password?" button below to set a new password '
+                    'for your account.',
+                )
+        return super().clean()
+
+    def confirm_login_allowed(self, user):
+        """Check whether a successfully authenticated user is permitted to log in"""
+        super().confirm_login_allowed(user)
+        # Optionally enforce password validation
+        if getattr(settings, "PASSWORD_POLICY_ENFORCE_AT_LOGIN", False):
+            try:
+                password_validation.validate_password(
+                    self.cleaned_data["password"], user
+                )
+            except ValidationError:
+                raise ValidationError(
+                    # dict mapping field to error / error list
+                    {
+                        "__all__": ValidationError(
+                            'You entered your password correctly, but it  does not '
+                            'meet our current length and complexity requirements. '
+                            'Please use the "Forgot your password?" button below to '
+                            'set a new password for your account.'
+                        ),
+                    }
+                )
+
+
+class AnyEmailLoginView(LoginView):
+    """LoginView that allows any email address as the username
+    
+    Redirects to the missing_person page instead of logging in if the user does not have a Person 
+    """
+    form_class = AnyEmailAuthenticationForm
+
+    def form_valid(self, form):
+        """Security check complete. Log the user in if they have a Person."""
+        user = form.get_user()  # user has authenticated at this point
+        if not hasattr(user, "person"):
+            logout(self.request)  # should not be logged in yet, but just in case...
+            return render(self.request, "registration/missing_person.html")
+        return super().form_valid(form)
+
 
 @login_required
 @person_required

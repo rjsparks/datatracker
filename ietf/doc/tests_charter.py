@@ -16,6 +16,7 @@ import debug                            # pyflakes:ignore
 from ietf.doc.factories import CharterFactory, NewRevisionDocEventFactory, TelechatDocEventFactory
 from ietf.doc.models import ( Document, State, BallotDocEvent, BallotType, NewRevisionDocEvent,
     TelechatDocEvent, WriteupDocEvent )
+from ietf.doc.storage_utils import retrieve_str
 from ietf.doc.utils_charter import ( next_revision, default_review_text, default_action_text,
     charter_name_for_group )
 from ietf.doc.utils import close_open_ballots
@@ -86,6 +87,10 @@ class ViewCharterTests(TestCase):
 
 class EditCharterTests(TestCase):
     settings_temp_path_overrides = TestCase.settings_temp_path_overrides + ['CHARTER_PATH']
+
+    def setUp(self):
+        super().setUp()
+        (Path(settings.FTP_DIR)/"charter").mkdir()
 
     def write_charter_file(self, charter):
         (Path(settings.CHARTER_PATH) / f"{charter.name}-{charter.rev}.txt").write_text("This is a charter.")
@@ -506,13 +511,21 @@ class EditCharterTests(TestCase):
         self.assertEqual(charter.rev, next_revision(prev_rev))
         self.assertTrue("new_revision" in charter.latest_event().type)
 
-        file_contents = (
-            Path(settings.CHARTER_PATH) / (charter.name + "-" + charter.rev + ".txt")
-        ).read_text("utf-8")
+        charter_path = Path(settings.CHARTER_PATH) / (charter.name + "-" + charter.rev + ".txt")
+        file_contents = (charter_path).read_text("utf-8")
         self.assertEqual(
             file_contents,
             "Windows line\nMac line\nUnix line\n" + utf_8_snippet.decode("utf-8"),
         )
+        ftp_charter_path = Path(settings.FTP_DIR) / "charter" / charter_path.name
+        self.assertTrue(ftp_charter_path.exists())
+        self.assertTrue(charter_path.samefile(ftp_charter_path))
+        blobstore_contents = retrieve_str("charter", charter.get_base_name())
+        self.assertEqual(
+            blobstore_contents,
+            "Windows line\nMac line\nUnix line\n" + utf_8_snippet.decode("utf-8"),
+        )        
+
 
     def test_submit_initial_charter(self):
         group = GroupFactory(type_id='wg',acronym='mars',list_email='mars-wg@ietf.org')
@@ -808,9 +821,11 @@ class EditCharterTests(TestCase):
         self.assertTrue(not charter.ballot_open("approve"))
 
         self.assertEqual(charter.rev, "01")
-        self.assertTrue(
-            (Path(settings.CHARTER_PATH) / ("charter-ietf-%s-%s.txt" % (group.acronym, charter.rev))).exists()
-        )
+        charter_path = Path(settings.CHARTER_PATH) / ("charter-ietf-%s-%s.txt" % (group.acronym, charter.rev))
+        charter_ftp_path = Path(settings.FTP_DIR) / "charter" / charter_path.name
+        self.assertTrue(charter_path.exists())
+        self.assertTrue(charter_ftp_path.exists())
+        self.assertTrue(charter_path.samefile(charter_ftp_path))
 
         self.assertEqual(len(outbox), 2)
         #

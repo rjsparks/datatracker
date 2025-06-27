@@ -24,32 +24,33 @@ from django.utils.encoding import force_str
 
 import debug                            # pyflakes:ignore
 
+from ietf.api.views import EmailIngestionError
 from ietf.dbtemplate.factories import DBTemplateFactory
 from ietf.dbtemplate.models import DBTemplate
 from ietf.doc.factories import DocEventFactory, WgDocumentAuthorFactory, \
                                NewRevisionDocEventFactory, DocumentAuthorFactory
 from ietf.group.factories import GroupFactory, GroupHistoryFactory, RoleFactory, RoleHistoryFactory
 from ietf.group.models import Group, Role
-from ietf.meeting.factories import MeetingFactory, AttendedFactory
+from ietf.meeting.factories import MeetingFactory, AttendedFactory, RegistrationFactory
+from ietf.meeting.models import Registration
 from ietf.message.models import Message
 from ietf.nomcom.test_data import nomcom_test_data, generate_cert, check_comments, \
                                   COMMUNITY_USER, CHAIR_USER, \
                                   MEMBER_USER, SECRETARIAT_USER, EMAIL_DOMAIN, NOMCOM_YEAR
 from ietf.nomcom.models import NomineePosition, Position, Nominee, \
                                NomineePositionStateName, Feedback, FeedbackTypeName, \
-                               Nomination, FeedbackLastSeen, TopicFeedbackLastSeen, ReminderDates
-from ietf.nomcom.management.commands.send_reminders import Command, is_time_to_send
+                               Nomination, FeedbackLastSeen, TopicFeedbackLastSeen, ReminderDates, \
+                               NomCom
 from ietf.nomcom.factories import NomComFactory, FeedbackFactory, TopicFactory, \
                                   nomcom_kwargs_for_year, provide_private_key_to_test_client, \
                                   key
+from ietf.nomcom.tasks import send_nomcom_reminders_task
 from ietf.nomcom.utils import get_nomcom_by_year, make_nomineeposition, \
                               get_hash_nominee_position, is_eligible, list_eligible, \
-                              get_eligibility_date, suggest_affiliation, \
-                              decorate_volunteers_with_qualifications
+                              get_eligibility_date, suggest_affiliation, ingest_feedback_email, \
+                              decorate_volunteers_with_qualifications, send_reminders, _is_time_to_send_reminder
 from ietf.person.factories import PersonFactory, EmailFactory
 from ietf.person.models import Email, Person
-from ietf.stats.models import MeetingRegistration
-from ietf.stats.factories import MeetingRegistrationFactory
 from ietf.utils.mail import outbox, empty_outbox, get_payload_text
 from ietf.utils.test_utils import login_testing_unauthorized, TestCase, unicontent
 from ietf.utils.timezone import date_today, datetime_today, datetime_from_date, DEADLINE_TZINFO
@@ -1114,6 +1115,47 @@ class FeedbackTest(TestCase):
         self.assertNotEqual(feedback.comments, comment_text)
         self.assertEqual(check_comments(feedback.comments, comment_text, self.privatekey_file), True)
 
+    @mock.patch("ietf.nomcom.utils.create_feedback_email")
+    def test_ingest_feedback_email(self, mock_create_feedback_email):
+        message = b"This is nomcom feedback"
+        no_nomcom_year = date_today().year + 10  # a guess at a year with no nomcoms
+        while NomCom.objects.filter(group__acronym__icontains=no_nomcom_year).exists():
+            no_nomcom_year += 1
+        inactive_nomcom = NomComFactory(group__state_id="conclude", group__acronym=f"nomcom{no_nomcom_year + 1}")
+
+        # cases where the nomcom does not exist, so admins are notified
+        for bad_year in (no_nomcom_year, inactive_nomcom.year()):
+            with self.assertRaises(EmailIngestionError) as context:
+                ingest_feedback_email(message, bad_year)
+            self.assertIn("does not exist", context.exception.msg)
+            self.assertIsNotNone(context.exception.email_body)  # error message to be sent
+            self.assertIsNone(context.exception.email_recipients)  # default recipients (i.e., admin)
+            self.assertIsNone(context.exception.email_original_message)  # no original message
+            self.assertFalse(context.exception.email_attach_traceback)  # no traceback
+            self.assertFalse(mock_create_feedback_email.called)
+        
+        # nomcom exists but an error occurs, so feedback goes to the nomcom chair
+        active_nomcom = NomComFactory(group__acronym=f"nomcom{no_nomcom_year + 2}")
+        mock_create_feedback_email.side_effect = ValueError("ouch!")
+        with self.assertRaises(EmailIngestionError) as context:
+            ingest_feedback_email(message, active_nomcom.year())
+        self.assertIn(f"Error ingesting nomcom {active_nomcom.year()}", context.exception.msg)
+        self.assertIsNotNone(context.exception.email_body)  # error message to be sent
+        self.assertEqual(context.exception.email_recipients, active_nomcom.chair_emails())
+        self.assertEqual(context.exception.email_original_message, message)
+        self.assertFalse(context.exception.email_attach_traceback)  # no traceback
+        self.assertTrue(mock_create_feedback_email.called)
+        self.assertEqual(mock_create_feedback_email.call_args, mock.call(active_nomcom, message))
+        mock_create_feedback_email.reset_mock()
+
+        # and, finally, success
+        mock_create_feedback_email.side_effect = None
+        mock_create_feedback_email.return_value = FeedbackFactory(author="someone@example.com")
+        ingest_feedback_email(message, active_nomcom.year())
+        self.assertTrue(mock_create_feedback_email.called)
+        self.assertEqual(mock_create_feedback_email.call_args, mock.call(active_nomcom, message))
+
+
 class ReminderTest(TestCase):
 
     def setUp(self):
@@ -1164,36 +1206,41 @@ class ReminderTest(TestCase):
         teardown_test_public_keys_dir(self)
         super().tearDown()
 
-    def test_is_time_to_send(self):
+    def test_is_time_to_send_reminder(self):
         self.nomcom.reminder_interval = 4
         today = date_today()
-        self.assertTrue(is_time_to_send(self.nomcom,today+datetime.timedelta(days=4),today))
+        self.assertTrue(
+            _is_time_to_send_reminder(self.nomcom, today + datetime.timedelta(days=4), today)
+        )
         for delta in range(4):
-            self.assertFalse(is_time_to_send(self.nomcom,today+datetime.timedelta(days=delta),today))
+            self.assertFalse(
+                _is_time_to_send_reminder(
+                    self.nomcom, today + datetime.timedelta(days=delta), today
+                )
+            )
         self.nomcom.reminder_interval = None
-        self.assertFalse(is_time_to_send(self.nomcom,today,today))
+        self.assertFalse(_is_time_to_send_reminder(self.nomcom, today, today))
         self.nomcom.reminderdates_set.create(date=today)
-        self.assertTrue(is_time_to_send(self.nomcom,today,today))
+        self.assertTrue(_is_time_to_send_reminder(self.nomcom, today, today))
 
-    def test_command(self):
-        c = Command()
-        messages_before=len(outbox)
+    def test_send_reminders(self):
+        messages_before = len(outbox)
         self.nomcom.reminder_interval = 3
         self.nomcom.save()
-        c.handle(None,None)
+        send_reminders()
         self.assertEqual(len(outbox), messages_before + 2)
         self.assertIn('nominee1@example.org', outbox[-1]['To'])
         self.assertIn('please complete', outbox[-1]['Subject'])
         self.assertIn('nominee1@example.org', outbox[-2]['To'])
         self.assertIn('please accept', outbox[-2]['Subject'])
-        messages_before=len(outbox)
+        messages_before = len(outbox)
         self.nomcom.reminder_interval = 4
         self.nomcom.save()
-        c.handle(None,None)
+        send_reminders()
         self.assertEqual(len(outbox), messages_before + 1)
         self.assertIn('nominee2@example.org', outbox[-1]['To'])
         self.assertIn('please accept', outbox[-1]['Subject'])
-     
+
     def test_remind_accept_view(self):
         url = reverse('ietf.nomcom.views.send_reminder_mail', kwargs={'year': NOMCOM_YEAR,'type':'accept'})
         login_testing_unauthorized(self, CHAIR_USER, url)
@@ -2013,7 +2060,15 @@ Junk body for testing
                 if not ' ' in ascii:
                     continue
                 first_name, last_name = ascii.rsplit(None, 1)
-                MeetingRegistration.objects.create(meeting=meeting, first_name=first_name, last_name=last_name, person=person, country_code='WO', email=email, attended=True)
+                RegistrationFactory(
+                    meeting=meeting,
+                    first_name=first_name,
+                    last_name=last_name,
+                    person=person,
+                    country_code='WO',
+                    email=email,
+                    attended=True
+                )
         for view in ('public_eligible','private_eligible'):
             url = reverse(f'ietf.nomcom.views.{view}',kwargs={'year':self.nc.year()})
             for username in (self.chair.user.username,'secretary'):
@@ -2036,7 +2091,7 @@ Junk body for testing
         for number in range(meeting_start, meeting_start+8):
             m = MeetingFactory.create(type_id='ietf', number=number)
             for p in people:
-                m.meetingregistration_set.create(person=p, reg_type="onsite", checkedin=True, attended=True)
+                RegistrationFactory(meeting=m, person=p, checkedin=True, attended=True)
         for p in people:
             self.nc.volunteer_set.create(person=p,affiliation='something')
         for view in ('public_volunteers','private_volunteers'):
@@ -2061,10 +2116,6 @@ Junk body for testing
         response = self.client.get(url)
         self.assertContains(response, people[-1].plain_name(), status_code=200)
         self.assertNotContains(response, unqualified_person.plain_name())
-
-
-
-
 
 class NomComIndexTests(TestCase):
     def setUp(self):
@@ -2412,7 +2463,7 @@ class rfc8713EligibilityTests(TestCase):
             for combo in combinations(meetings,combo_len):
                 p = PersonFactory()
                 for m in combo:
-                    MeetingRegistrationFactory(person=p, meeting=m, attended=True)
+                    RegistrationFactory(person=p, meeting=m, attended=True)
                 if combo_len<3:
                     self.ineligible_people.append(p)
                 else:
@@ -2422,7 +2473,7 @@ class rfc8713EligibilityTests(TestCase):
         def ineligible_person_with_role(**kwargs):
             p = RoleFactory(**kwargs).person
             for m in meetings:
-                MeetingRegistrationFactory(person=p, meeting=m, attended=True)
+                RegistrationFactory(person=p, meeting=m, attended=True)
             self.ineligible_people.append(p)
         for group in ['isocbot', 'ietf-trust', 'llc-board', 'iab']:
             for role in ['member', 'chair']:
@@ -2437,8 +2488,7 @@ class rfc8713EligibilityTests(TestCase):
         self.other_date = datetime.date(2009,5,1)
         self.other_people = PersonFactory.create_batch(1)
         for date in (datetime.date(2009,3,1), datetime.date(2008,11,1), datetime.date(2008,7,1)):
-            MeetingRegistrationFactory(person=self.other_people[0],meeting__date=date, meeting__type_id='ietf', attended=True)
-
+            RegistrationFactory(person=self.other_people[0], meeting__date=date, meeting__type_id='ietf', attended=True)
 
     def test_is_person_eligible(self):
         for person in self.eligible_people:
@@ -2482,7 +2532,7 @@ class rfc8788EligibilityTests(TestCase):
             for combo in combinations(meetings,combo_len):
                 p = PersonFactory()
                 for m in combo:
-                    MeetingRegistrationFactory(person=p, meeting=m, attended=True)
+                    RegistrationFactory(person=p, meeting=m, attended=True)
                 if combo_len<3:
                     self.ineligible_people.append(p)
                 else:
@@ -2530,7 +2580,7 @@ class rfc8989EligibilityTests(TestCase):
                 for combo in combinations(prev_five,combo_len):
                     p = PersonFactory()
                     for m in combo:
-                        MeetingRegistrationFactory(person=p, meeting=m, attended=True) # not checkedin because this forces looking at older meetings
+                        RegistrationFactory(person=p, meeting=m, attended=True) # not checkedin because this forces looking at older meetings
                         AttendedFactory(session__meeting=m, session__type_id='plenary',person=p)
                     if combo_len<3:
                         ineligible_people.append(p)
@@ -2545,8 +2595,9 @@ class rfc8989EligibilityTests(TestCase):
             for person in ineligible_people:
                 self.assertFalse(is_eligible(person,nomcom))
 
-            Person.objects.filter(pk__in=[p.pk for p in eligible_people+ineligible_people]).delete()
-
+            people = Person.objects.filter(pk__in=[p.pk for p in eligible_people + ineligible_people])
+            Registration.objects.filter(person__in=people).delete()
+            people.delete()
 
     def test_elig_by_office_active_groups(self):
 
@@ -2730,7 +2781,7 @@ class rfc9389EligibilityTests(TestCase):
     def test_registration_is_not_enough(self):
         p = PersonFactory()
         for meeting in self.meetings:
-            MeetingRegistrationFactory(person=p, meeting=meeting, checkedin=False)
+            RegistrationFactory(person=p, meeting=meeting, checkedin=False)
         self.assertFalse(is_eligible(p, self.nomcom))
 
     def test_elig_by_meetings(self):
@@ -2747,7 +2798,7 @@ class rfc9389EligibilityTests(TestCase):
                 for method in attendance_methods:
                     p = PersonFactory()
                     for meeting in combo:
-                        MeetingRegistrationFactory(person=p, meeting=meeting, reg_type='onsite', checkedin=(method in ('checkedin', 'both')))
+                        RegistrationFactory(person=p, meeting=meeting, checkedin=(method in ('checkedin', 'both')))
                         if method in ('session', 'both'):
                             AttendedFactory(session__meeting=meeting, session__type_id='plenary',person=p)
                         if combo_len<3:
@@ -2780,7 +2831,7 @@ class VolunteerTests(TestCase):
         self.assertContains(r, 'NomCom is not accepting volunteers at this time', status_code=200)
         nomcom.is_accepting_volunteers = True
         nomcom.save()
-        MeetingRegistrationFactory(person=person, affiliation='mtg_affiliation', checkedin=True)
+        RegistrationFactory(person=person, affiliation='mtg_affiliation', checkedin=True)
         r = self.client.get(url)
         self.assertContains(r, 'Volunteer for NomCom', status_code=200)
         self.assertContains(r, 'mtg_affiliation')
@@ -2834,7 +2885,7 @@ class VolunteerTests(TestCase):
         nc = NomComFactory()
         nc.volunteer_set.create(person=person,affiliation='volunteer_affil')
         self.assertEqual(suggest_affiliation(person), 'volunteer_affil')
-        MeetingRegistrationFactory(person=person, affiliation='meeting_affil')
+        RegistrationFactory(person=person, affiliation='meeting_affil')
         self.assertEqual(suggest_affiliation(person), 'meeting_affil')
 
 class VolunteerDecoratorUnitTests(TestCase):
@@ -2852,7 +2903,7 @@ class VolunteerDecoratorUnitTests(TestCase):
             ('106', datetime.date(2019, 11, 16)),
         ]]
         for m in meetings:
-            MeetingRegistrationFactory(meeting=m, person=meeting_person, attended=True)
+            RegistrationFactory(meeting=m, person=meeting_person, attended=True)
             AttendedFactory(session__meeting=m, session__type_id='plenary', person=meeting_person)
         nomcom.volunteer_set.create(person=meeting_person)
 
@@ -3005,3 +3056,10 @@ class ReclassifyFeedbackTests(TestCase):
         self.assertEqual(fb.type_id, 'junk')
         self.assertEqual(Feedback.objects.filter(type='read').count(), 0)
         self.assertEqual(Feedback.objects.filter(type='junk').count(), 1)
+
+
+class TaskTests(TestCase):
+    @mock.patch("ietf.nomcom.tasks.send_reminders")
+    def test_send_nomcom_reminders_task(self, mock_send):
+        send_nomcom_reminders_task()
+        self.assertEqual(mock_send.call_count, 1)

@@ -4,6 +4,7 @@
 
 import io
 import os
+from pathlib import Path
 import re
 import shutil
 import sys
@@ -14,8 +15,8 @@ from django.conf import settings
 
 import debug                            # pyflakes:ignore
 
+from ietf.utils import tool_version
 from ietf.utils.log import log, assertion
-from ietf.utils.models import VersionInfo
 from ietf.utils.pipe import pipe
 from ietf.utils.test_runner import set_coverage_checking
 
@@ -177,8 +178,10 @@ class DraftYangChecker(object):
         model_list = list(set(model_list))
 
         command = "xym"
-        cmd_version = VersionInfo.objects.get(command=command).version
-        message = "%s:\n%s\n\n" % (cmd_version, out.replace('\n\n','\n').strip() if code == 0 else err)
+        message = "{version}:\n{output}\n\n".format(
+            version=tool_version[command], 
+            output=out.replace('\n\n', '\n').strip() if code == 0 else err,
+        )
 
         results.append({
             "name": name,
@@ -209,7 +212,6 @@ class DraftYangChecker(object):
                 # pyang
                 cmd_template = settings.SUBMIT_PYANG_COMMAND
                 command = [ w for w in cmd_template.split() if not '=' in w ][0]
-                cmd_version = VersionInfo.objects.get(command=command).version
                 cmd = cmd_template.format(libs=modpath, model=path)
                 venv_path = os.environ.get('VIRTUAL_ENV') or os.path.join(os.getcwd(), 'env')
                 venv_bin = os.path.join(venv_path, 'bin')
@@ -238,14 +240,17 @@ class DraftYangChecker(object):
                             except ValueError:
                                 pass
                 #passed = passed and code == 0 # For the submission tool.  Yang checks always pass
-                message += "%s: %s:\n%s\n" % (cmd_version, cmd_template, out+"No validation errors\n" if (code == 0 and len(err) == 0) else out+err)
+                message += "{version}: {template}:\n{output}\n".format(
+                    version=tool_version[command],
+                    template=cmd_template,
+                    output=out + "No validation errors\n" if (code == 0 and len(err) == 0) else out + err,
+                )
 
                 # yanglint
                 set_coverage_checking(False) # we can't count the following as it may or may not be run, depending on setup
                 if settings.SUBMIT_YANGLINT_COMMAND and os.path.exists(settings.YANGLINT_BINARY):
                     cmd_template = settings.SUBMIT_YANGLINT_COMMAND
                     command = [ w for w in cmd_template.split() if not '=' in w ][0]
-                    cmd_version = VersionInfo.objects.get(command=command).version
                     cmd = cmd_template.format(model=path, rfclib=settings.SUBMIT_YANG_RFC_MODEL_DIR, tmplib=workdir,
                         draftlib=settings.SUBMIT_YANG_DRAFT_MODEL_DIR, ianalib=settings.SUBMIT_YANG_IANA_MODEL_DIR,
                         cataloglib=settings.SUBMIT_YANG_CATALOG_MODEL_DIR, )
@@ -264,7 +269,11 @@ class DraftYangChecker(object):
                                 except ValueError:
                                     pass
                     #passed = passed and code == 0 # For the submission tool.  Yang checks always pass
-                    message += "%s: %s:\n%s\n" % (cmd_version, cmd_template, out+"No validation errors\n" if (code == 0 and len(err) == 0) else out+err)
+                    message += "{version}: {template}:\n{output}\n".format(
+                        version=tool_version[command],
+                        template=cmd_template,
+                        output=out + "No validation errors\n" if (code == 0 and len(err) == 0) else out + err,
+                    )
                 set_coverage_checking(True)
             else:
                 errors += 1
@@ -272,6 +281,15 @@ class DraftYangChecker(object):
 
             dest = os.path.join(settings.SUBMIT_YANG_DRAFT_MODEL_DIR, model)
             shutil.move(path, dest)
+            ftp_dest = Path(settings.FTP_DIR) / "yang" / "draftmod" / model
+            try:
+                os.link(dest, ftp_dest)
+            except IOError as ex:
+                log(
+                    "There was an error creating a hardlink at %s pointing to %s: %s"
+                    % (ftp_dest, dest, ex)
+                )
+
 
             # summary result
             results.append({

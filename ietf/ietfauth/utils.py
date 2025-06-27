@@ -12,6 +12,8 @@ from urllib.parse import quote as urlquote
 
 from django.conf import settings
 from django.contrib.auth import REDIRECT_FIELD_NAME
+from django.contrib.sites.models import Site
+from django.core import signing
 from django.core.exceptions import PermissionDenied
 from django.db.models import Q
 from django.http import HttpResponseRedirect
@@ -20,9 +22,10 @@ from django.shortcuts import get_object_or_404
 import debug                            # pyflakes:ignore
 
 from ietf.group.models import Role, GroupFeatures
-from ietf.person.models import Person
+from ietf.person.models import Email, Person
 from ietf.person.utils import get_dots
 from ietf.doc.utils_bofreq import bofreq_editors
+from ietf.utils.mail import send_mail
 
 def user_is_person(user, person):
     """Test whether user is associated with person."""
@@ -38,9 +41,10 @@ def has_role(user, role_names, *args, **kwargs):
     """Determines whether user has any of the given standard roles
     given. Role names must be a list or, in case of a single value, a
     string."""
-    if not isinstance(role_names, (list, tuple)):
-        role_names = [ role_names ]
-    
+    extra_role_qs = kwargs.get("extra_role_qs", None)
+    if not isinstance(role_names, (list, tuple, set)):
+        role_names = [role_names]
+
     if not user or not user.is_authenticated:
         return False
 
@@ -48,7 +52,13 @@ def has_role(user, role_names, *args, **kwargs):
     if not hasattr(user, "roles_check_cache"):
         user.roles_check_cache = {}
 
-    key = frozenset(role_names)
+    keynames = set(role_names)
+    if extra_role_qs:
+        keynames.update(set(extra_role_qs.keys()))
+    year = kwargs.get("year", None)
+    if year is not None:
+        keynames.add(f"nomcomyear{year}")
+    key = frozenset(keynames)
     if key not in user.roles_check_cache:
         try:
             person = user.person
@@ -56,52 +66,121 @@ def has_role(user, role_names, *args, **kwargs):
             return False
 
         role_qs = {
-            "Area Director": Q(person=person, name__in=("pre-ad", "ad"), group__type="area", group__state="active"),
-            "Secretariat": Q(person=person, name="secr", group__acronym="secretariat"),
-            "IAB" : Q(person=person, name="member", group__acronym="iab"),
-            "IANA": Q(person=person, name="auth", group__acronym="iana"),
-            "RFC Editor": Q(person=person, name="auth", group__acronym="rpc"),
-            "ISE" : Q(person=person, name="chair", group__acronym="ise"),
-            "IAD": Q(person=person, name="admdir", group__acronym="ietf"),
-            "IETF Chair": Q(person=person, name="chair", group__acronym="ietf"),
-            "IETF Trust Chair": Q(person=person, name="chair", group__acronym="ietf-trust"),
-            "IRTF Chair": Q(person=person, name="chair", group__acronym="irtf"),
-            "RSAB Chair": Q(person=person, name="chair", group__acronym="rsab"),
-            "IAB Chair": Q(person=person, name="chair", group__acronym="iab"),
-            "IAB Executive Director": Q(person=person, name="execdir", group__acronym="iab"),
-            "IAB Group Chair": Q(person=person, name="chair", group__type="iab", group__state="active"),
-            "IAOC Chair": Q(person=person, name="chair", group__acronym="iaoc"),
-            "WG Chair": Q(person=person,name="chair", group__type="wg", group__state__in=["active","bof", "proposed"]),
-            "WG Secretary": Q(person=person,name="secr", group__type="wg", group__state__in=["active","bof", "proposed"]),
-            "RG Chair": Q(person=person,name="chair", group__type="rg", group__state__in=["active","proposed"]),
-            "RG Secretary": Q(person=person,name="secr", group__type="rg", group__state__in=["active","proposed"]),
-            "AG Secretary": Q(person=person,name="secr", group__type="ag", group__state__in=["active"]),
-            "RAG Secretary": Q(person=person,name="secr", group__type="rag", group__state__in=["active"]),
-            "Team Chair": Q(person=person,name="chair", group__type="team", group__state="active"),
-            "Program Lead": Q(person=person,name="lead", group__type="program", group__state="active"),
-            "Program Secretary": Q(person=person,name="secr", group__type="program", group__state="active"),
-            "Program Chair": Q(person=person,name="chair", group__type="program", group__state="active"),
-            "EDWG Chair": Q(person=person, name="chair", group__type="edwg", group__state="active"),
-            "Nomcom Chair": Q(person=person, name="chair", group__type="nomcom", group__acronym__icontains=kwargs.get('year', '0000')),
-            "Nomcom Advisor": Q(person=person, name="advisor", group__type="nomcom", group__acronym__icontains=kwargs.get('year', '0000')),
-            "Nomcom": Q(person=person, group__type="nomcom", group__acronym__icontains=kwargs.get('year', '0000')),
-            "Liaison Manager": Q(person=person,name="liaiman",group__type="sdo",group__state="active", ),
-            "Authorized Individual": Q(person=person,name="auth",group__type="sdo",group__state="active", ),
-            "Recording Manager": Q(person=person,name="recman",group__type="ietf",group__state="active", ),
-            "Reviewer": Q(person=person, name="reviewer", group__state="active"),
-            "Review Team Secretary": Q(person=person, name="secr", group__reviewteamsettings__isnull=False,group__state="active", ),
-            "IRSG Member": (Q(person=person, name="member", group__acronym="irsg") | Q(person=person, name="chair", group__acronym="irtf") | Q(person=person, name="atlarge", group__acronym="irsg")),
-            "RSAB Member": Q(person=person, name="member", group__acronym="rsab"), 
-            "Robot": Q(person=person, name="robot", group__acronym="secretariat"),
-            }
+            "Area Director": Q(
+                name__in=("pre-ad", "ad"), group__type="area", group__state="active"
+            ),
+            "Secretariat": Q(name="secr", group__acronym="secretariat"),
+            "IAB": Q(name="member", group__acronym="iab"),
+            "IANA": Q(name="auth", group__acronym="iana"),
+            "RFC Editor": Q(name="auth", group__acronym="rpc"),
+            "ISE": Q(name="chair", group__acronym="ise"),
+            "IAD": Q(name="admdir", group__acronym="ietf"),
+            "IETF Chair": Q(name="chair", group__acronym="ietf"),
+            "IETF Trust Chair": Q(name="chair", group__acronym="ietf-trust"),
+            "IRTF Chair": Q(name="chair", group__acronym="irtf"),
+            "RSAB Chair": Q(name="chair", group__acronym="rsab"),
+            "IAB Chair": Q(name="chair", group__acronym="iab"),
+            "IAB Executive Director": Q(name="execdir", group__acronym="iab"),
+            "IAB Group Chair": Q(
+                name="chair", group__type="iab", group__state="active"
+            ),
+            "IAOC Chair": Q(name="chair", group__acronym="iaoc"),
+            "WG Chair": Q(
+                name="chair",
+                group__type="wg",
+                group__state__in=["active", "bof", "proposed"],
+            ),
+            "WG Secretary": Q(
+                name="secr",
+                group__type="wg",
+                group__state__in=["active", "bof", "proposed"],
+            ),
+            "RG Chair": Q(
+                name="chair", group__type="rg", group__state__in=["active", "proposed"]
+            ),
+            "RG Secretary": Q(
+                name="secr", group__type="rg", group__state__in=["active", "proposed"]
+            ),
+            "AG Secretary": Q(
+                name="secr", group__type="ag", group__state__in=["active"]
+            ),
+            "RAG Secretary": Q(
+                name="secr", group__type="rag", group__state__in=["active"]
+            ),
+            "Team Chair": Q(name="chair", group__type="team", group__state="active"),
+            "Program Lead": Q(
+                name="lead", group__type="program", group__state="active"
+            ),
+            "Program Secretary": Q(
+                name="secr", group__type="program", group__state="active"
+            ),
+            "Program Chair": Q(
+                name="chair", group__type="program", group__state="active"
+            ),
+            "EDWG Chair": Q(name="chair", group__type="edwg", group__state="active"),
+            "Nomcom Chair": Q(
+                name="chair",
+                group__type="nomcom",
+                group__acronym__icontains=kwargs.get("year", "0000"),
+            ),
+            "Nomcom Advisor": Q(
+                name="advisor",
+                group__type="nomcom",
+                group__acronym__icontains=kwargs.get("year", "0000"),
+            ),
+            "Nomcom": Q(
+                group__type="nomcom",
+                group__acronym__icontains=kwargs.get("year", "0000"),
+            ),
+            "Liaison Manager": Q(
+                name="liaiman",
+                group__type="sdo",
+                group__state="active",
+            ),
+            "Liaison Coordinator": Q(
+                name="liaison_coordinator",
+                group__acronym="iab",
+            ),
+            "Authorized Individual": Q(
+                name="auth",
+                group__type="sdo",
+                group__state="active",
+            ),
+            "Recording Manager": Q(
+                name="recman",
+                group__type="ietf",
+                group__state="active",
+            ),
+            "Reviewer": Q(name="reviewer", group__state="active"),
+            "Review Team Secretary": Q(
+                name="secr",
+                group__reviewteamsettings__isnull=False,
+                group__state="active",
+            ),
+            "IRSG Member": (
+                Q(name="member", group__acronym="irsg")
+                | Q(name="chair", group__acronym="irtf")
+                | Q(name="atlarge", group__acronym="irsg")
+            ),
+            "RSAB Member": Q(name="member", group__acronym="rsab"),
+            "Robot": Q(name="robot", group__acronym="secretariat"),
+        }
 
-        filter_expr = Q(pk__in=[])  # ensure empty set is returned if no other terms are added
+        filter_expr = Q(
+            pk__in=[]
+        )  # ensure empty set is returned if no other terms are added
         for r in role_names:
             filter_expr |= role_qs[r]
+        if extra_role_qs:
+            for r in extra_role_qs:
+                filter_expr |= extra_role_qs[r]
 
-        user.roles_check_cache[key] = bool(Role.objects.filter(filter_expr).exists())
+        user.roles_check_cache[key] = bool(
+            Role.objects.filter(person=person).filter(filter_expr).exists()
+        )
 
     return user.roles_check_cache[key]
+
 
 
 # convenient decorator
@@ -271,13 +350,14 @@ class OidcExtraScopeClaims(oidc_provider.lib.claims.ScopeClaims):
         )
 
     def scope_registration(self):
+        # import here to avoid circular imports
         from ietf.meeting.helpers import get_current_ietf_meeting
-        from ietf.stats.models import MeetingRegistration
+        from ietf.meeting.models import Registration
         meeting = get_current_ietf_meeting()
         person = self.user.person
         email_list = person.email_set.values_list('address')
         q = Q(person=person, meeting=meeting) | Q(email__in=email_list, meeting=meeting)
-        regs = MeetingRegistration.objects.filter(q).distinct()
+        regs = Registration.objects.filter(q).distinct()
         for reg in regs:
             if not reg.person_id:
                 reg.person = person
@@ -288,19 +368,20 @@ class OidcExtraScopeClaims(oidc_provider.lib.claims.ScopeClaims):
             ticket_types = set([])
             reg_types = set([])
             for reg in regs:
-                ticket_types.add(reg.ticket_type)
-                reg_types.add(reg.reg_type)
+                for ticket in reg.tickets.all():
+                    ticket_types.add(ticket.ticket_type.slug)
+                    reg_types.add(ticket.attendance_type.slug)
             info = {
-                'meeting':      meeting.number,
+                'meeting': meeting.number,
                 # full_week, one_day, student:
-                'ticket_type':  ' '.join(ticket_types),
+                'ticket_type': ' '.join(ticket_types),
                 # onsite, remote, hackathon_onsite, hackathon_remote:
-                'reg_type':     ' '.join(reg_types),
-                'affiliation':  ([ reg.affiliation for reg in regs if reg.affiliation ] or [''])[0],
+                'reg_type': ' '.join(reg_types),
+                'affiliation': ([reg.affiliation for reg in regs if reg.affiliation] or [''])[0],
             }
 
         return info
-            
+
 def can_request_rfc_publication(user, doc):
     """Answers whether this user has an appropriate role to send this document to the RFC Editor for publication as an RFC.
 
@@ -322,3 +403,47 @@ def can_request_rfc_publication(user, doc):
         return False # See the docstring
     else:
         return False
+
+
+def send_new_email_confirmation_request(person: Person, address: str):
+    """Request confirmation of a new email address
+    
+    If the email address is already in use, sends an alert to it. If not, sends a confirmation request.
+    By design, does not indicate which was sent. This is intended to make it a bit harder to scrape addresses
+    with a mindless bot.
+    """
+    auth = signing.dumps([person.user.username, address], salt="add_email")
+    domain = Site.objects.get_current().domain
+    from_email = settings.DEFAULT_FROM_EMAIL
+
+    existing = Email.objects.filter(address=address).first()
+    if existing:
+        subject = f"Attempt to add your email address by {person.name}"
+        send_mail(
+            None,
+            address,
+            from_email,
+            subject,
+            "registration/add_email_exists_email.txt",
+            {
+                "domain": domain,
+                "email": address,
+                "person": person,
+            },
+        )
+    else:
+        subject = f"Confirm email address for {person.name}"
+        send_mail(
+            None,
+            address,
+            from_email,
+            subject,
+            "registration/add_email_email.txt",
+            {
+                "domain": domain,
+                "auth": auth,
+                "email": address,
+                "person": person,
+                "expire": settings.DAYS_TO_EXPIRE_REGISTRATION_LINK,
+            },
+        )

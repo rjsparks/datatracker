@@ -9,9 +9,12 @@
 #   ./manage.py test --settings=settings_test doc.ChangeStateTestCase
 #
 
-import os 
+import atexit
+import os
+import shutil
+import tempfile
 from ietf.settings import *                                          # pyflakes:ignore
-from ietf.settings import TEST_CODE_COVERAGE_CHECKER, BASE_DIR, PHOTOS_DIRNAME
+from ietf.settings import TEST_CODE_COVERAGE_CHECKER, ORIG_AUTH_PASSWORD_VALIDATORS
 import debug                            # pyflakes:ignore
 debug.debug = True
 
@@ -45,14 +48,27 @@ DATABASES = {
         },
     }
 
+# test with a single DB - do not use a DB router
+BLOBDB_DATABASE = "default"
+DATABASE_ROUTERS = []  # type: ignore
+
 if TEST_CODE_COVERAGE_CHECKER and not TEST_CODE_COVERAGE_CHECKER._started: # pyflakes:ignore
     TEST_CODE_COVERAGE_CHECKER.start()                          # pyflakes:ignore
 
-NOMCOM_PUBLIC_KEYS_DIR=os.path.abspath("tmp-nomcom-public-keys-dir")
 
-MEDIA_ROOT = os.path.join(os.path.dirname(BASE_DIR), 'test/media/') # pyflakes:ignore
-MEDIA_URL = '/test/media/'
-PHOTOS_DIR = MEDIA_ROOT + PHOTOS_DIRNAME                            # pyflakes:ignore
+def tempdir_with_cleanup(**kwargs):
+    """Utility to create a temporary dir and arrange cleanup"""
+    _dir = tempfile.mkdtemp(**kwargs)
+    atexit.register(shutil.rmtree, _dir)
+    return _dir
+
+
+NOMCOM_PUBLIC_KEYS_DIR = tempdir_with_cleanup(suffix="-nomcom-public-keys-dir")
+
+MEDIA_ROOT = tempdir_with_cleanup(suffix="-media")
+PHOTOS_DIRNAME = "photo"
+PHOTOS_DIR = os.path.join(MEDIA_ROOT, PHOTOS_DIRNAME)
+os.mkdir(PHOTOS_DIR)
 
 # Undo any developer-dependent middleware when running the tests
 MIDDLEWARE = [ c for c in MIDDLEWARE if not c in DEV_MIDDLEWARE ] # pyflakes:ignore
@@ -60,3 +76,42 @@ MIDDLEWARE = [ c for c in MIDDLEWARE if not c in DEV_MIDDLEWARE ] # pyflakes:ign
 TEMPLATES[0]['OPTIONS']['context_processors'] = [ p for p in TEMPLATES[0]['OPTIONS']['context_processors'] if not p in DEV_TEMPLATE_CONTEXT_PROCESSORS ] # pyflakes:ignore
 
 REQUEST_PROFILE_STORE_ANONYMOUS_SESSIONS = False
+
+# Override loggers with a safer set in case things go to the log during testing. Specifically,
+# make sure there are no syslog loggers that might send things to a real syslog.
+LOGGING["loggers"] = {  # pyflakes:ignore
+    'django': {
+        'handlers': ['debug_console'],
+        'level': 'INFO',
+    },
+    'django.request': {
+        'handlers': ['debug_console'],
+        'level': 'ERROR',
+    },
+    'django.server': {
+        'handlers': ['django.server'],
+        'level': 'INFO',
+    },
+    'django.security': {
+        'handlers': ['debug_console', ],
+        'level': 'INFO',
+    },
+    'oidc_provider': {
+        'handlers': ['debug_console', ],
+        'level': 'DEBUG',
+    },
+    'datatracker': {
+        'handlers': ['debug_console'],
+        'level': 'INFO',
+    },
+    'celery': {
+        'handlers': ['debug_console'],
+        'level': 'INFO',
+    },
+}
+
+# Restore AUTH_PASSWORD_VALIDATORS if they were reset in settings_local
+try:
+    AUTH_PASSWORD_VALIDATORS = ORIG_AUTH_PASSWORD_VALIDATORS
+except NameError:
+    pass

@@ -7,9 +7,22 @@ from ietf.doc.factories import (
     IndividualDraftFactory,
     CharterFactory,
     NewRevisionDocEventFactory,
+    StatusChangeFactory,
+    RgDraftFactory,
+    EditorialDraftFactory,
+    WgDraftFactory,
+    ConflictReviewFactory,
+    BofreqFactory,
+    StatementFactory,
+    RfcFactory,
 )
 from ietf.doc.models import DocEvent
-from ietf.doc.templatetags.ietf_filters import urlize_ietf_docs, is_valid_url
+from ietf.doc.templatetags.ietf_filters import (
+    urlize_ietf_docs,
+    is_valid_url,
+    is_in_stream,
+    is_unexpected_wg_state,
+)
 from ietf.person.models import Person
 from ietf.utils.test_utils import TestCase
 
@@ -19,13 +32,28 @@ import debug  # pyflakes: ignore
 
 
 class IetfFiltersTests(TestCase):
+    def test_is_in_stream(self):
+        for draft in [
+            IndividualDraftFactory(),
+            CharterFactory(),
+            StatusChangeFactory(),
+            ConflictReviewFactory(),
+            StatementFactory(),
+            BofreqFactory(),
+        ]:
+            self.assertFalse(is_in_stream(draft))
+        for draft in [RgDraftFactory(), WgDraftFactory(), EditorialDraftFactory()]:
+            self.assertTrue(is_in_stream(draft))
+        for stream in ["iab", "ietf", "irtf", "ise", "editorial"]:
+            self.assertTrue(is_in_stream(IndividualDraftFactory(stream_id=stream)))
+
     def test_is_valid_url(self):
         cases = [(settings.IDTRACKER_BASE_URL, True), ("not valid", False)]
         for url, result in cases:
             self.assertEqual(is_valid_url(url), result)
 
     def test_urlize_ietf_docs(self):
-        rfc = WgRfcFactory(rfc_number=123456,std_level_id="bcp")
+        rfc = WgRfcFactory(rfc_number=123456, std_level_id="bcp")
         rfc.save_with_history(
             [
                 DocEvent.objects.create(
@@ -57,7 +85,6 @@ class IetfFiltersTests(TestCase):
 
         cases = [
             ("no change", "no change"),
-
             # TODO: rework subseries when we add them
             # ("bCp123456", '<a href="/doc/bcp123456/">bCp123456</a>'),
             # ("Std 00123456", '<a href="/doc/std123456/">Std 00123456</a>'),
@@ -149,3 +176,17 @@ class IetfFiltersTests(TestCase):
         for input, output in cases:
             # debug.show("(input, urlize_ietf_docs(input), output)")
             self.assertEqual(urlize_ietf_docs(input), output)
+    
+    def test_is_unexpected_wg_state(self):
+        """
+        Test that the unexpected_wg_state function works correctly
+        """
+        # test documents with expected wg states
+        self.assertFalse(is_unexpected_wg_state(RfcFactory()))
+        self.assertFalse(is_unexpected_wg_state(WgDraftFactory (states=[('draft-stream-ietf', 'sub-pub')])))
+        self.assertFalse(is_unexpected_wg_state(WgDraftFactory (states=[('draft-iesg', 'idexists')])))
+        self.assertFalse(is_unexpected_wg_state(WgDraftFactory (states=[('draft-stream-ietf', 'wg-cand'), ('draft-iesg','idexists')])))
+
+        # test documents with unexpected wg states due to invalid combination of states
+        self.assertTrue(is_unexpected_wg_state(WgDraftFactory (states=[('draft-stream-ietf', 'wg-cand'), ('draft-iesg','lc-req')])))
+        self.assertTrue(is_unexpected_wg_state(WgDraftFactory (states=[('draft-stream-ietf', 'chair-w'), ('draft-iesg','pub-req')])))

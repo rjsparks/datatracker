@@ -8,7 +8,7 @@ import faker
 import faker.config
 import os
 import random
-import shutil
+from PIL import Image
 
 from unidecode import unidecode
 from unicodedata import normalize
@@ -26,20 +26,22 @@ from ietf.person.name import normalize_name, unidecode_name
 
 fake = faker.Factory.create()
 
-def setup():
-    global acceptable_fakers
-    # The transliteration of some Arabic and Devanagari names introduces
-    # non-alphabetic characters that don't work with the draft author
-    # extraction code, and also don't seem to match the way people with Arabic
-    # names romanize Arabic names.  Exclude those locales from name generation
-    # in order to avoid test failures.
-    locales = set( [ l for l in faker.config.AVAILABLE_LOCALES if not (l.startswith('ar_') or l.startswith('sg_') or l=='fr_QC') ] )
-    acceptable_fakers = [faker.Faker(locale) for locale in locales]
-setup()
+# The transliteration of some Arabic and Devanagari names introduces
+# non-alphabetic characters that don't work with the draft author
+# extraction code, and also don't seem to match the way people with Arabic
+# names romanize Arabic names.  Exclude those locales from name generation
+# in order to avoid test failures.
+_acceptable_fakers = [
+    faker.Faker(locale)
+    for locale in set(faker.config.AVAILABLE_LOCALES)
+    if not (locale.startswith('ar_') or locale.startswith('sg_') or locale == 'fr_QC')
+]
+
 
 def random_faker():
-    global acceptable_fakers
-    return random.sample(acceptable_fakers, 1)[0]
+    """Helper to get a random faker acceptable for User names"""
+    return random.sample(_acceptable_fakers, 1)[0]
+
 
 class UserFactory(factory.django.DjangoModelFactory):
     class Meta:
@@ -103,10 +105,9 @@ class PersonFactory(factory.django.DjangoModelFactory):
             media_name = "%s/%s.jpg" % (settings.PHOTOS_DIRNAME, photo_name)
             obj.photo = media_name
             obj.photo_thumb = media_name
-            photosrc = os.path.join(settings.TEST_DATA_DIR, "profile-default.jpg")
             photodst = os.path.join(settings.PHOTOS_DIR,  photo_name + '.jpg')
-            if not os.path.exists(photodst):
-                shutil.copy(photosrc, photodst)
+            img = Image.new('RGB', (200, 200))
+            img.save(photodst)
             def delete_file(file):
                 os.unlink(file)
             atexit.register(delete_file, photodst)
@@ -159,10 +160,22 @@ class EmailFactory(factory.django.DjangoModelFactory):
 
 class PersonalApiKeyFactory(factory.django.DjangoModelFactory):
     person = factory.SubFactory(PersonFactory)
-    endpoint = FuzzyChoice(PERSON_API_KEY_ENDPOINTS)
-
+    endpoint = FuzzyChoice(v for v, n in PERSON_API_KEY_ENDPOINTS)
+    
     class Meta:
         model = PersonalApiKey
+        skip_postgeneration_save = True
+
+    @factory.post_generation
+    def validate_model(obj, create, extracted, **kwargs):
+        """Validate the model after creation
+        
+        Passing validate_model=False will disable the validation.
+        """
+        do_clean =  True if extracted is None else extracted
+        if do_clean:
+            obj.full_clean()
+
 
 class PersonApiKeyEventFactory(factory.django.DjangoModelFactory):
     key = factory.SubFactory(PersonalApiKeyFactory)

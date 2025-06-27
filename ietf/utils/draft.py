@@ -65,7 +65,6 @@ progdir = os.path.dirname(sys.argv[0])
 opt_debug = False
 opt_timestamp = False
 opt_trace = False
-opt_authorinfo = False
 opt_attributes = False
 # Don't forget to add the option variable to the globals list in _main below
 
@@ -130,6 +129,24 @@ def acronym_match(s, l):
     acronym = re.sub("[^A-Z]", "", l)
     #_debug(" s:%s; l:%s => %s; %s" % (s, l, acronym, s==acronym)) 
     return s == acronym
+
+def get_status_from_draft_text(text):
+
+    # Take prefix to shortcut work over very large drafts
+    # 5000 is conservatively much more than a full page of characters and we
+    # only want the first 10 lines.
+    text = text.strip()[:5000] # Take prefix to shortcut work over very large drafts 
+    text = re.sub(".\x08", "", text)    # Get rid of inkribbon backspace-emphasis
+    text = text.replace("\r\n", "\n")   # Convert DOS to unix
+    text = text.replace("\r", "\n")     # Convert MAC to unix
+    lines = text.split("\n")[:10]
+    status = None
+    for line in lines:
+        status_match = re.search(r"^\s*Intended [Ss]tatus:\s*(.*?)   ", line)
+        if status_match:
+            status = status_match.group(1)
+            break
+    return status
 
 class Draft:
     """Base class for drafts
@@ -1314,8 +1331,6 @@ def getmeta(fn):
 
 # ----------------------------------------------------------------------
 def _output(docname, fields, outfile=sys.stdout):
-    global company_domain
-
     if opt_attributes:
         def outputkey(key, fields):
             field = fields[key]
@@ -1355,9 +1370,8 @@ def _printmeta(fn, outfile=sys.stdout):
 # Main
 # ----------------------------------------------------------------------
 
-company_domain = {}                     # type: Dict[str, str]
 def _main(outfile=sys.stdout):
-    global opt_debug, opt_timestamp, opt_trace, opt_authorinfo, files, company_domain, opt_attributes
+    global opt_debug, opt_timestamp, opt_trace, files, opt_attributes
     # set default values, if any
     # ----------------------------------------------------------------------
     # Option processing
@@ -1405,8 +1419,6 @@ def _main(outfile=sys.stdout):
         elif opt in ["-T", "--trace"]: # Emit trace information while working
             opt_trace = True
 
-    company_domain = {}
- 
     if not files:
         files = [ "-" ]
 

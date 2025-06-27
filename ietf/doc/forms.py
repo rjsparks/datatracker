@@ -1,4 +1,4 @@
-# Copyright The IETF Trust 2013-2020, All Rights Reserved
+# Copyright The IETF Trust 2013-2025, All Rights Reserved
 # -*- coding: utf-8 -*-
 
 
@@ -9,7 +9,7 @@ from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.validators import validate_email
 
 from ietf.doc.fields import SearchableDocumentField, SearchableDocumentsField
-from ietf.doc.models import RelatedDocument, DocExtResource
+from ietf.doc.models import RelatedDocument, DocExtResource, State
 from ietf.iesg.models import TelechatDate
 from ietf.iesg.utils import telechat_page_count
 from ietf.person.fields import SearchablePersonField, SearchablePersonsField
@@ -61,7 +61,7 @@ class DocAuthorChangeBasisForm(forms.Form):
     basis = forms.CharField(max_length=255, 
                             label='Reason for change', 
                             help_text='What is the source or reasoning for the changes to the author list?')
-    
+
 class AdForm(forms.Form):
     ad = forms.ModelChoiceField(Person.objects.filter(role__name="ad", role__group__state="active", role__group__type='area').order_by('name'),
                                 label="Shepherding AD", empty_label="(None)", required=True)
@@ -266,3 +266,32 @@ class ExtResourceForm(forms.Form):
     @staticmethod
     def valid_resource_tags():
         return ExtResourceName.objects.all().order_by('slug').values_list('slug', flat=True)
+
+class InvestigateForm(forms.Form):
+    name_fragment = forms.CharField(
+        label="File name or fragment to investigate",
+        required=True,
+        help_text=(
+            "Enter a filename such as draft-ietf-some-draft-00.txt or a fragment like draft-ietf-some-draft using at least 8 characters. The search will also work for files that are not necessarily drafts."
+        ),
+        min_length=8,
+    )
+    task_id = forms.CharField(required=False, widget=forms.HiddenInput)
+
+    def clean_name_fragment(self):
+        disallowed_characters = ["%", "/", "\\", "*"]
+        name_fragment = self.cleaned_data["name_fragment"]
+        # Manual inspection of the directories at the time of this writing shows
+        # looking for files with less than 8 characters in the name is not useful
+        # Requiring this will help protect against the secretariat unintentionally
+        # matching every draft.
+        if any(c in name_fragment for c in disallowed_characters):
+            raise ValidationError(f"The following characters are disallowed: {', '.join(disallowed_characters)}")
+        return name_fragment
+
+
+class ChangeStatementStateForm(forms.Form):
+    state = forms.ModelChoiceField(
+        State.objects.filter(used=True, type="statement"),
+        empty_label=None,
+    )
