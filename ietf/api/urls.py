@@ -49,6 +49,9 @@ urlpatterns = [
     url(r'^group/role-holder-addresses/$', api_views.role_holder_addresses),
     # Let IESG members set positions programmatically
     url(r'^iesg/position', views_ballot.api_set_position),
+    # Find the blob to store for a given materials document path
+    url(r'^meeting/(?:(?P<num>(?:interim-)?[a-z0-9-]+)/)?materials/%(document)s(?P<ext>\.[A-Za-z0-9]+)?/resolve-cached/$' % settings.URL_REGEXPS, meeting_views.api_resolve_materials_name_cached),
+    url(r'^meeting/blob/(?P<bucket>[a-z0-9-]+)/(?P<name>[a-z][a-z0-9.-]+)$', meeting_views.api_retrieve_materials_blob),
     # Let Meetecho set session video URLs
     url(r'^meeting/session/video/url$', meeting_views.api_set_session_video_url),
     # Let Meetecho tell us the name of its recordings
@@ -66,12 +69,14 @@ urlpatterns = [
     # Let MeetEcho upload session polls
     url(r'^notify/session/polls/?$', meeting_views.api_upload_polls),    
     # Let the registration system notify us about registrations
-    url(r'^notify/meeting/registration/?', api_views.api_new_meeting_registration),
+    url(r'^notify/meeting/registration/v2/?', api_views.api_new_meeting_registration_v2),
     # OpenID authentication provider
     url(r'^openid/$', TemplateView.as_view(template_name='api/openid-issuer.html'), name='ietf.api.urls.oidc_issuer'),
     url(r'^openid/', include('oidc_provider.urls', namespace='oidc_provider')),
     # Email alias listing
     url(r'^person/email/$', api_views.active_email_list),
+    # Related Email listing
+    url(r'^person/email/(?P<email>[^/\x00]+)/related/$', api_views.related_email_list),
     # Draft submission API
     url(r'^submit/?$', submit_views.api_submit_tombstone),
     # Draft upload API

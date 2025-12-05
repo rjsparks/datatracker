@@ -4,7 +4,6 @@
 
 import email.utils
 import email.header
-import jsonfield
 import uuid
 
 from hashids import Hashids
@@ -29,7 +28,7 @@ import debug                            # pyflakes:ignore
 from ietf.name.models import ExtResourceName
 from ietf.person.name import name_parts, initials, plain_name
 from ietf.utils.mail import send_mail_preformatted
-from ietf.utils.storage import NoLocationMigrationFileSystemStorage
+from ietf.utils.storage import BlobShadowFileSystemStorage
 from ietf.utils.mail import formataddr
 from ietf.person.name import unidecode_name
 from ietf.utils import log
@@ -57,11 +56,21 @@ class Person(models.Model):
     ascii = models.CharField("Full Name (ASCII)", max_length=255, help_text="Name as rendered in ASCII (Latin, unaccented) characters.", validators=[name_character_validator])
     # The short ascii-form of the name.  Also in alias table if non-null
     ascii_short = models.CharField("Abbreviated Name (ASCII)", max_length=32, null=True, blank=True, help_text="Example: A. Nonymous.  Fill in this with initials and surname only if taking the initials and surname of the ASCII name above produces an incorrect initials-only form. (Blank is OK).", validators=[name_character_validator])
-    pronouns_selectable = jsonfield.JSONCharField("Pronouns", max_length=120, blank=True, null=True, default=list )
+    pronouns_selectable = models.JSONField("Pronouns", max_length=120, blank=True, null=True, default=list )
     pronouns_freetext = models.CharField(" ", max_length=30, null=True, blank=True, help_text="Optionally provide your personal pronouns. These will be displayed on your public profile page and alongside your name in Meetecho and, in future, other systems. Select any number of the checkboxes OR provide a custom string up to 30 characters.")
     biography = models.TextField(blank=True, help_text="Short biography for use on leadership pages. Use plain text or reStructuredText markup.")
-    photo = models.ImageField(storage=NoLocationMigrationFileSystemStorage(), upload_to=settings.PHOTOS_DIRNAME, blank=True, default=None)
-    photo_thumb = models.ImageField(storage=NoLocationMigrationFileSystemStorage(), upload_to=settings.PHOTOS_DIRNAME, blank=True, default=None)
+    photo = models.ImageField(
+        storage=BlobShadowFileSystemStorage(kind="photo"),
+        upload_to=settings.PHOTOS_DIRNAME,
+        blank=True,
+        default=None,
+    )
+    photo_thumb = models.ImageField(
+        storage=BlobShadowFileSystemStorage(kind="photo"),
+        upload_to=settings.PHOTOS_DIRNAME,
+        blank=True,
+        default=None,
+    )
     name_from_draft = models.CharField("Full Name (from submission)", null=True, max_length=255, editable=False, help_text="Name as found in an Internet-Draft submission.")
 
     def __str__(self):

@@ -114,9 +114,11 @@
         "ietf/static/js/add_session_recordings.js",
         "ietf/static/js/agenda_filter.js",
         "ietf/static/js/agenda_materials.js",
+        "ietf/static/js/announcement.js",
         "ietf/static/js/complete-review.js",
         "ietf/static/js/create_timeslot.js",
         "ietf/static/js/create_timeslot.js",
+        "ietf/static/js/custom_striped.js",
         "ietf/static/js/d3.js",
         "ietf/static/js/datepicker.js",
         "ietf/static/js/doc-search.js",
@@ -147,6 +149,8 @@
         "ietf/static/js/password_strength.js",
         "ietf/static/js/select2.js",
         "ietf/static/js/session_details_form.js",
+        "ietf/static/js/session_form.js",
+        "ietf/static/js/session_request.js",
         "ietf/static/js/sortable.js",
         "ietf/static/js/stats.js",
         "ietf/static/js/status-change-edit-relations.js",
@@ -207,8 +211,6 @@
         "ietf/secr/static/images/tooltag-arrowright.webp",
         "ietf/secr/static/images/tooltag-arrowright_over.webp",
         "ietf/secr/static/js/dynamic_inlines.js",
-        "ietf/secr/static/js/session_form.js",
-        "ietf/secr/static/js/sessions.js",
         "ietf/secr/static/js/utils.js"
       ]
     }

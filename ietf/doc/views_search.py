@@ -59,7 +59,7 @@ from django.utils.text import slugify
 import debug                            # pyflakes:ignore
 
 from ietf.doc.models import ( Document, DocHistory, State,
-    LastCallDocEvent, NewRevisionDocEvent, IESG_SUBSTATE_TAGS,
+    NewRevisionDocEvent, IESG_SUBSTATE_TAGS,
     IESG_BALLOT_ACTIVE_STATES, IESG_STATCHG_CONFLREV_ACTIVE_STATES,
     IESG_CHARTER_ACTIVE_STATES )
 from ietf.doc.fields import select2_id_doc_name_json
@@ -74,7 +74,7 @@ from ietf.utils.fields import ModelMultipleChoiceField
 from ietf.utils.log import log
 from ietf.doc.utils_search import prepare_document_table, doc_type, doc_state, doc_type_name, AD_WORKLOAD
 from ietf.ietfauth.utils import has_role
-
+from ietf.utils.unicodenormalize import normalize_for_sorting
 
 class SearchForm(forms.Form):
     name = forms.CharField(required=False)
@@ -480,6 +480,7 @@ def ad_workload(request):
     ).distinct():
         if p in get_active_ads():
             ads.append(p)
+    ads.sort(key=lambda p: normalize_for_sorting(p.plain_name()))
 
     bucket_template = {
         dt: {state: [[] for _ in range(days)] for state in STATE_SLUGS[dt].values()}
@@ -665,6 +666,7 @@ def docs_for_ad(request, name):
                 r.get_state_slug("draft-iesg") == "dead"
                 or r.get_state_slug("draft") == "repl"
                 or r.get_state_slug("draft") == "rfc"
+                or (r.get_state_slug("draft") == "expired" and r.get_state_slug("draft-iesg") == "idexists")
             )
         )
     ]
@@ -752,6 +754,90 @@ def docs_for_ad(request, name):
     )
 
 
+def docs_for_iesg(request):
+    def sort_key(doc):
+        dt = doc_type(doc)
+        dt_key = list(AD_WORKLOAD.keys()).index(dt)
+        ds = doc_state(doc)
+        ds_key = AD_WORKLOAD[dt].index(ds) if ds in AD_WORKLOAD[dt] else 99
+        return dt_key * 100 + ds_key
+
+    results, meta = prepare_document_table(
+        request,
+        Document.objects.filter(
+            ad__in=Person.objects.filter(
+                Q(
+                    role__name__in=("pre-ad", "ad"),
+                    role__group__type="area",
+                    role__group__state="active",
+                )
+            )
+        ).exclude(
+            type_id="rfc",
+        ).exclude(
+            type_id="draft",
+            states__type="draft", 
+            states__slug__in=["repl", "rfc"],
+        ).exclude(
+            type_id="draft",
+            states__type="draft-iesg",
+            states__slug__in=["idexists", "rfcqueue"],
+        ).exclude(
+            type_id="conflrev",
+            states__type="conflrev",
+            states__slug__in=["appr-noprob-sent", "appr-reqnopub-sent", "withdraw", "dead"],
+        ).exclude(
+            type_id="statchg",
+            states__type="statchg",
+            states__slug__in=["appr-sent", "dead"],
+        ).exclude(
+            type_id="charter",
+            states__type="charter",
+            states__slug__in=["notrev", "infrev", "approved", "replaced"],
+        ),
+        max_results=1000,
+        show_ad_and_shepherd=True,
+    )
+    results.sort(key=lambda d: sort_key(d))
+
+    # filter out some results
+    results = [
+        r
+        for r in results
+        if not (
+            r.type_id == "charter"
+            and (
+                r.group.state_id == "abandon"
+                or r.get_state_slug("charter") == "replaced"
+            )
+        )
+        and not (
+            r.type_id == "draft"
+            and (
+                r.get_state_slug("draft-iesg") == "dead"
+                or r.get_state_slug("draft") == "repl"
+                or r.get_state_slug("draft") == "rfc"
+            )
+        )
+    ]
+
+    _calculate_state_name = get_state_name_calculator()
+    for d in results:
+        dt = d.type.slug
+        d.search_heading = _calculate_state_name(dt, doc_state(d))
+        if d.search_heading != "RFC":
+            d.search_heading += f" {doc_type_name(dt)}"
+
+    return render(
+        request,
+        "doc/drafts_for_iesg.html",
+        {
+            "docs": results,
+            "meta": meta,
+        },
+    )
+
+
 def drafts_in_last_call(request):
     lc_state = State.objects.get(type="draft-iesg", slug="lc").pk
     form = SearchForm({'by':'state','state': lc_state, 'rfcs':'on', 'activedrafts':'on'})
@@ -763,31 +849,6 @@ def drafts_in_last_call(request):
     return render(request, 'doc/drafts_in_last_call.html', {
         'form':form, 'docs':results, 'meta':meta, 'pages':pages
     })
-
-def drafts_in_iesg_process(request):
-    states = State.objects.filter(type="draft-iesg").exclude(slug__in=('idexists', 'pub', 'dead', 'rfcqueue'))
-    title = "Documents in IESG process"
-
-    grouped_docs = []
-
-    for s in states.order_by("order"):
-        docs = Document.objects.filter(type="draft", states=s).distinct().order_by("time").select_related("ad", "group", "group__parent")
-        if docs:
-            if s.slug == "lc":
-                for d in docs:
-                    e = d.latest_event(LastCallDocEvent, type="sent_last_call")
-                    # If we don't have an event, use an arbitrary date in the past (but not datetime.datetime.min,
-                    # which causes problems with timezone conversions)
-                    d.lc_expires = e.expires if e else datetime.datetime(1950, 1, 1)
-                docs = list(docs)
-                docs.sort(key=lambda d: d.lc_expires)
-
-            grouped_docs.append((s, docs))
-
-    return render(request, 'doc/drafts_in_iesg_process.html', {
-            "grouped_docs": grouped_docs,
-            "title": title,
-            })
 
 def recent_drafts(request, days=7):
     slowcache = caches['slowpages']

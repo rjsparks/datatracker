@@ -1,11 +1,27 @@
-# Copyright The IETF Trust 2007-2019, All Rights Reserved
+# Copyright The IETF Trust 2007-2025, All Rights Reserved
 # -*- coding: utf-8 -*-
 
-from ietf.settings import *                                          # pyflakes:ignore
+from ietf.settings import *  # pyflakes:ignore
+from ietf.settings import (
+    ARTIFACT_STORAGE_NAMES,
+    STORAGES,
+    BLOBSTORAGE_MAX_ATTEMPTS,
+    BLOBSTORAGE_READ_TIMEOUT,
+    BLOBSTORAGE_CONNECT_TIMEOUT,
+)
 
 ALLOWED_HOSTS = ['*']
 
-from ietf.settings_postgresqldb import DATABASES   # pyflakes:ignore
+from ietf.settings_postgresqldb import DATABASES  # pyflakes:ignore
+DATABASE_ROUTERS = ["ietf.blobdb.routers.BlobdbStorageRouter"]
+BLOBDB_DATABASE = "blobdb"
+BLOBDB_REPLICATION = {
+    "ENABLED": True,
+    "DEST_STORAGE_PATTERN": "r2-{bucket}",
+    "INCLUDE_BUCKETS": ARTIFACT_STORAGE_NAMES,
+    "EXCLUDE_BUCKETS": ["staging"],
+    "VERBOSE_LOGGING": True,
+}
 
 IDSUBMIT_IDNITS_BINARY = "/usr/local/bin/idnits"
 IDSUBMIT_STAGING_PATH = "/assets/www6s/staging/"
@@ -59,3 +75,28 @@ DE_GFM_BINARY = '/usr/local/bin/de-gfm'
 
 STATIC_IETF_ORG = "/_static"
 STATIC_IETF_ORG_INTERNAL = "http://static"
+
+
+# Blob replication storage for dev
+import botocore.config
+for storagename in ARTIFACT_STORAGE_NAMES:
+    replica_storagename = f"r2-{storagename}"
+    STORAGES[replica_storagename] = {
+        "BACKEND": "ietf.doc.storage.MetadataS3Storage",
+        "OPTIONS": dict(
+            endpoint_url="http://blobstore:9000",
+            access_key="minio_root",
+            secret_key="minio_pass",
+            security_token=None,
+            client_config=botocore.config.Config(
+                request_checksum_calculation="when_required",
+                response_checksum_validation="when_required",
+                signature_version="s3v4",
+                connect_timeout=BLOBSTORAGE_CONNECT_TIMEOUT,
+                read_timeout=BLOBSTORAGE_READ_TIMEOUT,
+                retries={"total_max_attempts": BLOBSTORAGE_MAX_ATTEMPTS},
+            ),
+            verify=False,
+            bucket_name=f"{storagename}",
+        ),
+    }

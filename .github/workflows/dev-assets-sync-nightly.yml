@@ -41,23 +41,9 @@ jobs:
       - name: Docker Build & Push
         uses: docker/build-push-action@v6
         env:
-          DOCKER_BUILD_NO_SUMMARY: true
+          DOCKER_BUILD_SUMMARY: false
         with:
           context: .
           file: dev/shared-assets-sync/Dockerfile
           push: true
           tags: ghcr.io/ietf-tools/datatracker-rsync-assets:latest
-          
-  sync:
-    name: Run assets rsync
-    if: ${{ always() }}
-    runs-on: [self-hosted, dev-server]
-    needs: [build]
-    steps:
-    - name: Run rsync
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        docker pull ghcr.io/ietf-tools/datatracker-rsync-assets:latest
-        docker run --rm -v dt-assets:/assets ghcr.io/ietf-tools/datatracker-rsync-assets:latest
-        docker image prune -a -f

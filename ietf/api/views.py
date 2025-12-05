@@ -16,9 +16,7 @@ from django.conf import settings
 from django.contrib.auth import authenticate
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
-from django.core.exceptions import ValidationError
-from django.core.validators import validate_email
-from django.http import HttpResponse, Http404, JsonResponse
+from django.http import HttpResponse, Http404, JsonResponse, HttpResponseBadRequest
 from django.shortcuts import render, get_object_or_404
 from django.urls import reverse
 from django.utils.decorators import method_decorator
@@ -43,13 +41,11 @@ from ietf.api.serializer import JsonExportMixin
 from ietf.doc.utils import DraftAliasGenerator, fuzzy_find_documents
 from ietf.group.utils import GroupAliasGenerator, role_holder_emails
 from ietf.ietfauth.utils import role_required
-from ietf.ietfauth.views import send_account_creation_email
 from ietf.ipr.utils import ingest_response_email as ipr_ingest_response_email
 from ietf.meeting.models import Meeting
-from ietf.nomcom.models import Volunteer, NomCom
+from ietf.meeting.utils import import_registration_json_validator, process_single_registration
 from ietf.nomcom.utils import ingest_feedback_email as nomcom_ingest_feedback_email
 from ietf.person.models import Person, Email
-from ietf.stats.models import MeetingRegistration
 from ietf.sync.iana import ingest_review_email as iana_ingest_review_email
 from ietf.utils import log
 from ietf.utils.decorators import require_api_key
@@ -68,7 +64,10 @@ def top_level(request):
         }
 
     serializer = Serializer()
-    desired_format = determine_format(request, serializer)
+    try:
+        desired_format = determine_format(request, serializer)
+    except BadRequest as err:
+        return HttpResponseBadRequest(str(err))
 
     options = {}
 
@@ -76,10 +75,12 @@ def top_level(request):
         callback = request.GET.get('callback', 'callback')
 
         if not is_valid_jsonp_callback_value(callback):
-            raise BadRequest('JSONP callback name is invalid.')
+            return HttpResponseBadRequest("JSONP callback name is invalid")
 
         options['callback'] = callback
 
+    # This might raise UnsupportedFormat, but that indicates a real server misconfiguration
+    # so let it bubble up unhandled and trigger a 500 / email to admins.
     serialized = serializer.serialize(available_resources, desired_format, options)
     return HttpResponse(content=serialized, content_type=build_content_type(desired_format))
 
@@ -113,7 +114,11 @@ class ApiV2PersonExportView(DetailView, JsonExportMixin):
     model = Person
 
     def err(self, code, text):
-        return HttpResponse(text, status=code, content_type='text/plain')
+        return HttpResponse(
+            text,
+            status=code,
+            content_type=f"text/plain; charset={settings.DEFAULT_CHARSET}",
+        )
 
     def post(self, request):
         querydict = request.POST.copy()
@@ -145,95 +150,61 @@ class ApiV2PersonExportView(DetailView, JsonExportMixin):
 #     else:
 #         return HttpResponse(status=405)
 
-@require_api_key
-@role_required('Robot')
-@csrf_exempt
-def api_new_meeting_registration(request):
-    '''REST API to notify the datatracker about a new meeting registration'''
-    def err(code, text):
-        return HttpResponse(text, status=code, content_type='text/plain')
-    required_fields = [ 'meeting', 'first_name', 'last_name', 'affiliation', 'country_code',
-                        'email', 'reg_type', 'ticket_type', 'checkedin', 'is_nomcom_volunteer']
-    fields = required_fields + []
-    if request.method == 'POST':
-        # parameters:
-        #   apikey:
-        #   meeting
-        #   name
-        #   email
-        #   reg_type (In Person, Remote, Hackathon Only)
-        #   ticket_type (full_week, one_day, student)
-        #   
-        data = {'attended': False, }
-        missing_fields = []
-        for item in fields:
-            value = request.POST.get(item, None)
-            if value is None and item in required_fields:
-                missing_fields.append(item)
-            data[item] = value
-        if missing_fields:
-            return err(400, "Missing parameters: %s" % ', '.join(missing_fields))
-        number = data['meeting']
-        try:
-            meeting = Meeting.objects.get(number=number)
-        except Meeting.DoesNotExist:
-            return err(400, "Invalid meeting value: '%s'" % (number, ))
-        reg_type = data['reg_type']
-        email = data['email']
-        try:
-            validate_email(email)
-        except ValidationError:
-            return err(400, "Invalid email value: '%s'" % (email, ))
-        if request.POST.get('cancelled', 'false') == 'true':
-            MeetingRegistration.objects.filter(
-                meeting_id=meeting.pk,
-                email=email,
-                reg_type=reg_type).delete()
-            return HttpResponse('OK', status=200, content_type='text/plain')
-        else:
-            object, created = MeetingRegistration.objects.get_or_create(
-                meeting_id=meeting.pk,
-                email=email,
-                reg_type=reg_type)
-            try:
-                # Update attributes
-                for key in set(data.keys())-set(['attended', 'apikey', 'meeting', 'email']):
-                    if key == 'checkedin':
-                        new = bool(data.get(key).lower() == 'true')
-                    else:
-                        new = data.get(key)
-                    setattr(object, key, new)
-                person = Person.objects.filter(email__address=email)
-                if person.exists():
-                    object.person = person.first()
-                object.save()
-            except ValueError as e:
-                return err(400, "Unexpected POST data: %s" % e)
-            response = "Accepted, New registration" if created else "Accepted, Updated registration"
-            if User.objects.filter(username__iexact=email).exists() or Email.objects.filter(address=email).exists():
-                pass
-            else:
-                send_account_creation_email(request, email)
-                response += ", Email sent"
 
-            # handle nomcom volunteer
-            if request.POST.get('is_nomcom_volunteer', 'false').lower() == 'true' and object.person:
-                try:
-                    nomcom = NomCom.objects.get(is_accepting_volunteers=True)
-                except (NomCom.DoesNotExist, NomCom.MultipleObjectsReturned):
-                    nomcom = None
-                if nomcom:
-                    Volunteer.objects.get_or_create(
-                        nomcom=nomcom,
-                        person=object.person,
-                        defaults={
-                            "affiliation": data["affiliation"],
-                            "origin": "registration"
-                        }
-                    )
-            return HttpResponse(response, status=202, content_type='text/plain')
-    else:
-        return HttpResponse(status=405)
+@requires_api_token
+@csrf_exempt
+def api_new_meeting_registration_v2(request):
+    '''REST API to notify the datatracker about a new meeting registration'''
+    def _http_err(code, text):
+        return HttpResponse(
+            text,
+            status=code,
+            content_type=f"text/plain; charset={settings.DEFAULT_CHARSET}",
+        )
+
+    def _api_response(result):
+        return JsonResponse(data={"result": result})
+
+    if request.method != "POST":
+        return _http_err(405, "Method not allowed")
+
+    if request.content_type != "application/json":
+        return _http_err(415, "Content-Type must be application/json")
+
+    # Validate
+    try:
+        payload = json.loads(request.body)
+        import_registration_json_validator.validate(payload)
+    except json.decoder.JSONDecodeError as err:
+        return _http_err(400, f"JSON parse error at line {err.lineno} col {err.colno}: {err.msg}")
+    except jsonschema.exceptions.ValidationError as err:
+        return _http_err(400, f"JSON schema error at {err.json_path}: {err.message}")
+    except Exception:
+        return _http_err(400, "Invalid request format")
+
+    # Get the meeting ID from the first registration, the API only deals with one meeting at a time
+    first_email = next(iter(payload['objects']))
+    meeting_number = payload['objects'][first_email]['meeting']
+    try:
+        meeting = Meeting.objects.get(number=meeting_number)
+    except Meeting.DoesNotExist:
+        return _http_err(400, f"Invalid meeting value: {meeting_number}")
+
+    # confirm email exists
+    try:
+        Email.objects.get(address=first_email)
+    except Email.DoesNotExist:
+        return _http_err(400, f"Unknown email: {first_email}")
+
+    reg_data = payload['objects'][first_email]
+
+    process_single_registration(reg_data, meeting)
+
+    return HttpResponse(
+        'Success',
+        status=202,
+        content_type=f"text/plain; charset={settings.DEFAULT_CHARSET}",
+    )
 
 
 def version(request):
@@ -546,6 +517,35 @@ def active_email_list(request):
 
 
 @requires_api_token
+@csrf_exempt
+def related_email_list(request, email):
+    """Given an email address, returns all other email addresses known
+    to Datatracker, via Person object
+    """
+    def _http_err(code, text):
+        return HttpResponse(
+            text,
+            status=code,
+            content_type=f"text/plain; charset={settings.DEFAULT_CHARSET}",
+        )
+
+    if request.method == "GET":
+        try:
+            email_obj = Email.objects.get(address=email)
+        except Email.DoesNotExist:
+            return _http_err(404, "Email not found")
+        person = email_obj.person
+        if not person:
+            return JsonResponse({"addresses": []})
+        return JsonResponse(
+            {
+                "addresses": list(person.email_set.values_list("address", flat=True)),
+            }
+        )
+    return HttpResponse(status=405)
+
+
+@requires_api_token
 def role_holder_addresses(request):
     if request.method == "GET":
         return JsonResponse(
@@ -653,7 +653,11 @@ def ingest_email_handler(request, test_mode=False):
     """
 
     def _http_err(code, text):
-        return HttpResponse(text, status=code, content_type="text/plain")
+        return HttpResponse(
+            text,
+            status=code,
+            content_type=f"text/plain; charset={settings.DEFAULT_CHARSET}",
+        )
 
     def _api_response(result):
         return JsonResponse(data={"result": result})

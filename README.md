@@ -5,10 +5,10 @@
 [![Release](https://img.shields.io/github/release/ietf-tools/datatracker.svg?style=flat&maxAge=300)](https://github.com/ietf-tools/datatracker/releases)
 [![License](https://img.shields.io/github/license/ietf-tools/datatracker)](https://github.com/ietf-tools/datatracker/blob/main/LICENSE)
 [![Code Coverage](https://codecov.io/gh/ietf-tools/datatracker/branch/feat/bs5/graph/badge.svg?token=V4DXB0Q28C)](https://codecov.io/gh/ietf-tools/datatracker)  
-[![Python Version](https://img.shields.io/badge/python-3.9-blue?logo=python&logoColor=white)](#prerequisites)
+[![Python Version](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](#prerequisites)
 [![Django Version](https://img.shields.io/badge/django-4.x-51be95?logo=django&logoColor=white)](#prerequisites)
 [![Node Version](https://img.shields.io/badge/node.js-16.x-green?logo=node.js&logoColor=white)](#prerequisites)
-[![MariaDB Version](https://img.shields.io/badge/postgres-16-blue?logo=postgresql&logoColor=white)](#prerequisites)
+[![MariaDB Version](https://img.shields.io/badge/postgres-17-blue?logo=postgresql&logoColor=white)](#prerequisites)
 
 ##### The day-to-day front-end to the IETF database for people who work on IETF standards.
 
@@ -44,6 +44,7 @@
 
 This project is following the standard **Git Feature Workflow** development model. Learn about all the various steps of the development workflow, from creating a fork to submitting a pull request, in the [Contributing](https://github.com/ietf-tools/.github/blob/main/CONTRIBUTING.md) guide.
 
+> [!TIP]  
 > Make sure to read the [Styleguides](https://github.com/ietf-tools/.github/blob/main/CONTRIBUTING.md#styleguides) section to ensure a cohesive code format across the project.
 
 You can submit bug reports, enhancement and new feature requests in the [discussions](https://github.com/ietf-tools/datatracker/discussions) area. Accepted tickets will be converted to issues.
@@ -52,7 +53,8 @@ You can submit bug reports, enhancement and new feature requests in the [discuss
 
 Click the <kbd>Fork</kbd> button in the top-right corner of the repository to create a personal copy that you can work on.
 
-> Note that some GitHub Actions might be enabled by default in your fork. You should disable them by going to **Settings** > **Actions** > **General** and selecting **Disable actions** (then Save).
+> [!NOTE]  
+> Some GitHub Actions might be enabled by default in your fork. You should disable them by going to **Settings** > **Actions** > **General** and selecting **Disable actions** (then Save).
 
 #### Git Cloning Tips
 
@@ -104,7 +106,25 @@ Read the [Docker Dev Environment](docker/README.md) guide to get started.
 
 Nightly database dumps of the datatracker are available as Docker images: `ghcr.io/ietf-tools/datatracker-db:latest`  
 
-> Note that to update the database in your dev environment to the latest version, you should run the `docker/cleandb` script.
+> [!TIP]  
+> In order to update the database in your dev environment to the latest version, you should run the `docker/cleandb` script.
+
+### Blob storage for dev/test
+
+The dev and test environments use [minio](https://github.com/minio/minio) to provide local blob storage. See the settings files for how the app container communicates with the blobstore container. If you need to work with minio directly from outside the containers (to interact with its api or console), use `docker compose` from the top level directory of your clone to expose it at an ephemeral port.
+
+```
+$ docker compose port blobstore 9001
+0.0.0.0:<some ephemeral port>
+
+$ curl -I http://localhost:<some ephemeral port>
+HTTP/1.1 200 OK
+...
+```
+
+
+The minio container exposes the minio api at port 9000 and the minio console at port 9001
+
 
 ### Frontend Development
 
@@ -122,7 +142,7 @@ Pages will gradually be updated to Vue 3 components. These components are locate
 
 Each Vue 3 app has its own sub-directory. For example, the agenda app is located under `/client/agenda`.
 
-The datatracker makes use of the Django-Vite plugin to point to either the Vite.js server or the precompiled production files. The `DJANGO_VITE_DEV_MODE` flag, found in the `ietf/settings_local.py` file determines whether the Vite.js server is used or not.
+The datatracker makes use of the Django-Vite plugin to point to either the Vite.js server or the precompiled production files. The `DJANGO_VITE["default"]["dev_mode"]` flag, found in the `ietf/settings_local.py` file determines whether the Vite.js server is used or not.
 
 In development mode, you must start the Vite.js development server, in addition to the usual Datatracker server:
 
@@ -231,6 +251,7 @@ From a datatracker container, run the command:
 ./ietf/manage.py test --settings=settings_test
 ```
 
+> [!TIP]  
 > You can limit the run to specific tests using the `--pattern` argument.
 
 ### Frontend Tests
@@ -240,11 +261,13 @@ Frontend tests are done via Playwright. There're 2 different type of tests:
 - Tests that test Vue pages / components and run natively without any external dependency.
 - Tests that require a running datatracker instance to test against (usually legacy views).
 
+> [!IMPORTANT]  
 > Make sure you have Node.js 16.x or later installed on your machine.
 
 #### Run Vue Tests
 
-> :warning: All commands below **MUST** be run from the `./playwright` directory, unless noted otherwise.
+> [!WARNING]  
+> All commands below **MUST** be run from the `./playwright` directory, unless noted otherwise.
 
 1. Run **once** to install dependencies on your system:
     ```sh
@@ -277,7 +300,8 @@ Frontend tests are done via Playwright. There're 2 different type of tests:
 
 First, you need to start a datatracker instance (dev or prod), ideally from a docker container, exposing the 8000 port.
 
-> :warning: All commands below **MUST** be run from the `./playwright` directory.
+> [!WARNING]  
+> All commands below **MUST** be run from the `./playwright` directory.
 
 1. Run **once** to install dependencies on your system:
 ```sh

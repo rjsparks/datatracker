@@ -28,11 +28,11 @@ from ietf.ipr.forms import (HolderIprDisclosureForm, GenericDisclosureForm,
     AddCommentForm, AddEmailForm, NotifyForm, StateForm, NonDocSpecificIprDisclosureForm,
     GenericIprDisclosureForm)
 from ietf.ipr.models import (IprDisclosureStateName, IprDisclosureBase,
-    HolderIprDisclosure, GenericIprDisclosure, ThirdPartyIprDisclosure,
+    HolderIprDisclosure, GenericIprDisclosure, RemovedIprDisclosure, ThirdPartyIprDisclosure,
     NonDocSpecificIprDisclosure, IprDocRel,
     RelatedIpr,IprEvent)
 from ietf.ipr.utils import (get_genitive, get_ipr_summary,
-    iprs_from_docs, related_docs)
+    iprs_from_docs, json_dump_disclosure, related_docs)
 from ietf.mailtrigger.utils import gather_address_lists
 from ietf.message.models import Message
 from ietf.message.utils import infer_message
@@ -152,13 +152,13 @@ def ipr_rfc_number(disclosureDate, thirdPartyDisclosureFlag):
 
     # RFC publication date comes from the RFC Editor announcement
     ipr_rfc_pub_datetime = {
-        1310 : datetime.datetime(1992,  3, 13,  0,  0, tzinfo=datetime.timezone.utc),
-        1802 : datetime.datetime(1994,  3, 23,  0,  0, tzinfo=datetime.timezone.utc),
-        2026 : datetime.datetime(1996, 10, 29,  0,  0, tzinfo=datetime.timezone.utc),
-        3668 : datetime.datetime(2004,  2, 18,  0,  0, tzinfo=datetime.timezone.utc),
-        3979 : datetime.datetime(2005,  3,  2,  2, 23, tzinfo=datetime.timezone.utc),
-        4879 : datetime.datetime(2007,  4, 10, 18, 21, tzinfo=datetime.timezone.utc),
-        8179 : datetime.datetime(2017,  5, 31, 23,  1, tzinfo=datetime.timezone.utc),
+        1310 : datetime.datetime(1992,  3, 13,  0,  0, tzinfo=datetime.UTC),
+        1802 : datetime.datetime(1994,  3, 23,  0,  0, tzinfo=datetime.UTC),
+        2026 : datetime.datetime(1996, 10, 29,  0,  0, tzinfo=datetime.UTC),
+        3668 : datetime.datetime(2004,  2, 18,  0,  0, tzinfo=datetime.UTC),
+        3979 : datetime.datetime(2005,  3,  2,  2, 23, tzinfo=datetime.UTC),
+        4879 : datetime.datetime(2007,  4, 10, 18, 21, tzinfo=datetime.UTC),
+        8179 : datetime.datetime(2017,  5, 31, 23,  1, tzinfo=datetime.UTC),
     }
 
     if disclosureDate < ipr_rfc_pub_datetime[1310]:
@@ -817,7 +817,14 @@ def get_details_tabs(ipr, selected):
 
 def show(request, id):
     """View of individual declaration"""
-    ipr = get_object_or_404(IprDisclosureBase, id=id).get_child()
+    ipr = IprDisclosureBase.objects.filter(id=id)
+    removed = RemovedIprDisclosure.objects.filter(removed_id=id)
+    if removed.exists():
+        return render(request, "ipr/deleted.html", {"removed": removed.get(), "ipr": ipr})
+    if not ipr.exists():
+        raise Http404
+    else:
+        ipr = ipr.get().get_child()
     if not has_role(request.user, 'Secretariat'):
         if ipr.state.slug in ['removed', 'removed_objfalse']:
             return render(request, "ipr/removed.html", {
@@ -901,3 +908,8 @@ def update(request, id):
     child = ipr.get_child()
     type = class_to_type[child.__class__.__name__]
     return new(request, type, updates=id)
+
+@role_required("Secretariat")
+def json_snapshot(request, id):
+    obj = get_object_or_404(IprDisclosureBase,id=id).get_child()
+    return HttpResponse(json_dump_disclosure(obj),content_type="application/json")

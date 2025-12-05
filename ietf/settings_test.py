@@ -14,7 +14,7 @@ import os
 import shutil
 import tempfile
 from ietf.settings import *                                          # pyflakes:ignore
-from ietf.settings import TEST_CODE_COVERAGE_CHECKER
+from ietf.settings import ORIG_AUTH_PASSWORD_VALIDATORS
 import debug                            # pyflakes:ignore
 debug.debug = True
 
@@ -48,9 +48,12 @@ DATABASES = {
         },
     }
 
-if TEST_CODE_COVERAGE_CHECKER and not TEST_CODE_COVERAGE_CHECKER._started: # pyflakes:ignore
-    TEST_CODE_COVERAGE_CHECKER.start()                          # pyflakes:ignore
+# test with a single DB - do not use a DB router
+BLOBDB_DATABASE = "default"
+DATABASE_ROUTERS = []  # type: ignore
 
+if TEST_CODE_COVERAGE_CHECKER: # pyflakes:ignore
+    TEST_CODE_COVERAGE_CHECKER.start()                          # pyflakes:ignore
 
 def tempdir_with_cleanup(**kwargs):
     """Utility to create a temporary dir and arrange cleanup"""
@@ -105,3 +108,9 @@ LOGGING["loggers"] = {  # pyflakes:ignore
         'level': 'INFO',
     },
 }
+
+# Restore AUTH_PASSWORD_VALIDATORS if they were reset in settings_local
+try:
+    AUTH_PASSWORD_VALIDATORS = ORIG_AUTH_PASSWORD_VALIDATORS
+except NameError:
+    pass

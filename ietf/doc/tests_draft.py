@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 
 
+import json
 import os
 import datetime
 import io
-import mock
+from unittest import mock
 
 from collections import Counter
 from pathlib import Path
 from pyquery import PyQuery
 
-from django.db.models import Q
+from django.db.models import Max, Q
 from django.urls import reverse as urlreverse
 from django.conf import settings
 from django.utils import timezone
@@ -24,6 +25,7 @@ from ietf.doc.factories import EditorialDraftFactory, IndividualDraftFactory, Wg
 from ietf.doc.models import ( Document, DocReminder, DocEvent,
     ConsensusDocEvent, LastCallDocEvent, RelatedDocument, State, TelechatDocEvent, 
     WriteupDocEvent, DocRelationshipName, IanaExpertDocEvent )
+from ietf.doc.storage_utils import exists_in_storage, store_str
 from ietf.doc.utils import get_tags_for_stream_id, create_ballot_if_not_open
 from ietf.doc.views_draft import AdoptDraftForm
 from ietf.name.models import DocTagName, RoleName
@@ -577,6 +579,11 @@ class DraftFileMixin():
     def write_draft_file(self, name, size):
         with (Path(settings.INTERNET_DRAFT_PATH) / name).open('w') as f:
             f.write("a" * size)
+        _, ext = os.path.splitext(name)
+        if ext:
+            ext=ext[1:]
+            store_str("active-draft", f"{ext}/{name}", "a"*size, allow_overwrite=True)
+            store_str("draft", f"{ext}/{name}", "a"*size, allow_overwrite=True)
 
 
 class ResurrectTests(DraftFileMixin, TestCase):
@@ -649,6 +656,7 @@ class ResurrectTests(DraftFileMixin, TestCase):
         # ensure file restored from archive directory
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, txt)))
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, txt)))
+        self.assertTrue(exists_in_storage("active-draft",f"txt/{txt}"))
 
 
 class ExpireIDsTests(DraftFileMixin, TestCase):
@@ -671,11 +679,11 @@ class ExpireIDsTests(DraftFileMixin, TestCase):
             datetime.datetime.combine(
                 ietf_monday - datetime.timedelta(days=1),
                 datetime.time(0, 0, 0),
-                tzinfo=datetime.timezone.utc,
+                tzinfo=datetime.UTC,
             )
         ))
         self.assertFalse(in_draft_expire_freeze(
-            datetime.datetime.combine(ietf_monday, datetime.time(0, 0, 0), tzinfo=datetime.timezone.utc)
+            datetime.datetime.combine(ietf_monday, datetime.time(0, 0, 0), tzinfo=datetime.UTC)
         ))
         
     def test_warn_expirable_drafts(self):
@@ -775,6 +783,7 @@ class ExpireIDsTests(DraftFileMixin, TestCase):
         self.assertEqual(draft.action_holders.count(), 0)
         self.assertIn('Removed all action holders', draft.latest_event(type='changed_action_holders').desc)
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, txt)))
+        self.assertFalse(exists_in_storage("active-draft", f"txt/{txt}"))
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, txt)))
 
         draft.delete()
@@ -798,6 +807,7 @@ class ExpireIDsTests(DraftFileMixin, TestCase):
         clean_up_draft_files()
         
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, unknown)))
+        self.assertFalse(exists_in_storage("active-draft", f"txt/{unknown}"))
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, "unknown_ids", unknown)))
 
         
@@ -808,6 +818,7 @@ class ExpireIDsTests(DraftFileMixin, TestCase):
         clean_up_draft_files()
         
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, malformed)))
+        self.assertFalse(exists_in_storage("active-draft", f"txt/{malformed}"))
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, "unknown_ids", malformed)))
 
         
@@ -822,9 +833,11 @@ class ExpireIDsTests(DraftFileMixin, TestCase):
         clean_up_draft_files()
         
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, txt)))
+        self.assertFalse(exists_in_storage("active-draft", f"txt/{txt}"))
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, txt)))
 
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, pdf)))
+        self.assertFalse(exists_in_storage("active-draft", f"pdf/{pdf}"))
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, pdf)))
 
         # expire draft
@@ -843,6 +856,7 @@ class ExpireIDsTests(DraftFileMixin, TestCase):
         clean_up_draft_files()
         
         self.assertTrue(not os.path.exists(os.path.join(settings.INTERNET_DRAFT_PATH, txt)))
+        self.assertFalse(exists_in_storage("active-draft", f"txt/{txt}"))
         self.assertTrue(os.path.exists(os.path.join(settings.INTERNET_DRAFT_ARCHIVE_DIR, txt)))
 
 
@@ -1694,11 +1708,12 @@ class AdoptDraftTests(TestCase):
                 self.assertEqual(draft.group, chair_role.group)
                 self.assertEqual(draft.stream_id, stream_state_type_slug[type_id][13:]) # trim off "draft-stream-"
                 self.assertEqual(draft.docevent_set.count() - events_before, 5)
-                self.assertEqual(len(outbox), 1)
-                self.assertTrue("Call For Adoption" in outbox[-1]["Subject"])
-                self.assertTrue(f"{chair_role.group.acronym}-chairs@" in outbox[-1]['To'])
-                self.assertTrue(f"{draft.name}@" in outbox[-1]['To'])
-                self.assertTrue(f"{chair_role.group.acronym}@" in outbox[-1]['To'])
+                self.assertEqual(len(outbox), 2)
+                self.assertTrue("Call For Adoption" in outbox[0]["Subject"])
+                self.assertTrue(f"{chair_role.group.acronym}-chairs@" in outbox[0]['To'])
+                self.assertTrue(f"{draft.name}@" in outbox[0]['To'])
+                self.assertTrue(f"{chair_role.group.acronym}@" in outbox[0]['To'])
+                # contents of outbox[1] are tested elsewhere
 
             # adopt
             empty_outbox()
@@ -1988,6 +2003,200 @@ class ChangeStreamStateTests(TestCase):
         self.assertTrue("mars-chairs@ietf.org" in outbox[0].as_string())
         self.assertTrue("marsdelegate@ietf.org" in outbox[0].as_string())
 
+    def test_wg_call_for_adoption_issued(self):
+        role = RoleFactory(
+            name_id="chair",
+            group__acronym="mars",
+            group__list_email="mars-wg@ietf.org",
+            person__user__username="marschairman",
+            person__name="WG Cháir Man",
+        )
+        # First test the usual workflow through the manage adoption view
+        draft = IndividualDraftFactory()
+        url = urlreverse(
+            "ietf.doc.views_draft.adopt_draft", kwargs=dict(name=draft.name)
+        )
+        login_testing_unauthorized(self, "marschairman", url)
+        empty_outbox()
+        call_issued = State.objects.get(type="draft-stream-ietf", slug="c-adopt")
+        r = self.client.post(
+            url,
+            dict(
+                comment="some comment",
+                group=role.group.pk,
+                newstate=call_issued.pk,
+                weeks="10",
+            ),
+        )
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(len(outbox), 2)
+        self.assertIn("mars-wg@ietf.org", outbox[1]["To"])
+        self.assertIn("Call for adoption", outbox[1]["Subject"])
+        body = get_payload_text(outbox[1])
+        self.assertIn("disclosure obligations", body)
+        self.assertIn("starts a 10-week", body)
+        # Test not entering a duration on the form
+        draft = IndividualDraftFactory()
+        url = urlreverse(
+            "ietf.doc.views_draft.adopt_draft", kwargs=dict(name=draft.name)
+        )
+        empty_outbox()
+        call_issued = State.objects.get(type="draft-stream-ietf", slug="c-adopt")
+        r = self.client.post(
+            url,
+            dict(
+                comment="some comment",
+                group=role.group.pk,
+                newstate=call_issued.pk,
+            ),
+        )
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(len(outbox), 2)
+        self.assertIn("mars-wg@ietf.org", outbox[1]["To"])
+        self.assertIn("Call for adoption", outbox[1]["Subject"])
+        body = get_payload_text(outbox[1])
+        self.assertIn("disclosure obligations", body)
+        self.assertIn("starts a 2-week", body)
+
+        # Test the less usual workflow of issuing a call for adoption 
+        # of a document that's already in the ietf stream
+        draft = WgDraftFactory(group=role.group)
+        url = urlreverse(
+            "ietf.doc.views_draft.change_stream_state",
+            kwargs=dict(name=draft.name, state_type="draft-stream-ietf"),
+        )
+        old_state = draft.get_state("draft-stream-%s" % draft.stream_id)
+        new_state = State.objects.get(
+            used=True, type="draft-stream-%s" % draft.stream_id, slug="c-adopt"
+        )
+        self.assertNotEqual(old_state, new_state)
+        empty_outbox()
+        r = self.client.post(
+            url,
+            dict(
+                new_state=new_state.pk,
+                comment="some comment",
+                weeks="10",
+                tags=[
+                    t.pk
+                    for t in draft.tags.filter(
+                        slug__in=get_tags_for_stream_id(draft.stream_id)
+                    )
+                ],
+            ),
+        )
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(len(outbox), 2)
+        self.assertIn("mars-wg@ietf.org", outbox[1]["To"])
+        self.assertIn("Call for adoption", outbox[1]["Subject"])
+        body = get_payload_text(outbox[1])
+        self.assertIn("disclosure obligations", body)
+        self.assertIn("starts a 10-week", body)
+        draft = WgDraftFactory(group=role.group)
+        url = urlreverse(
+            "ietf.doc.views_draft.change_stream_state",
+            kwargs=dict(name=draft.name, state_type="draft-stream-ietf"),
+        )
+        old_state = draft.get_state("draft-stream-%s" % draft.stream_id)
+        new_state = State.objects.get(
+            used=True, type="draft-stream-%s" % draft.stream_id, slug="c-adopt"
+        )
+        self.assertNotEqual(old_state, new_state)
+        empty_outbox()
+        r = self.client.post(
+            url,
+            dict(
+                new_state=new_state.pk,
+                comment="some comment",
+                tags=[
+                    t.pk
+                    for t in draft.tags.filter(
+                        slug__in=get_tags_for_stream_id(draft.stream_id)
+                    )
+                ],
+            ),
+        )
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(len(outbox), 2)
+        self.assertIn("mars-wg@ietf.org", outbox[1]["To"])
+        self.assertIn("Call for adoption", outbox[1]["Subject"])
+        body = get_payload_text(outbox[1])
+        self.assertIn("disclosure obligations", body)
+        self.assertIn("starts a 2-week", body)
+
+    def test_wg_last_call_issued(self):
+        role = RoleFactory(
+            name_id="chair",
+            group__acronym="mars",
+            group__list_email="mars-wg@ietf.org",
+            person__user__username="marschairman",
+            person__name="WG Cháir Man",
+        )
+        draft = WgDraftFactory(group=role.group)
+        url = urlreverse(
+            "ietf.doc.views_draft.change_stream_state",
+            kwargs=dict(name=draft.name, state_type="draft-stream-ietf"),
+        )
+        login_testing_unauthorized(self, "marschairman", url)
+        old_state = draft.get_state("draft-stream-%s" % draft.stream_id)
+        new_state = State.objects.get(
+            used=True, type="draft-stream-%s" % draft.stream_id, slug="wg-lc"
+        )
+        self.assertNotEqual(old_state, new_state)
+        empty_outbox()
+        r = self.client.post(
+            url,
+            dict(
+                new_state=new_state.pk,
+                comment="some comment",
+                weeks="10",
+                tags=[
+                    t.pk
+                    for t in draft.tags.filter(
+                        slug__in=get_tags_for_stream_id(draft.stream_id)
+                    )
+                ],
+            ),
+        )
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(len(outbox), 2)
+        self.assertIn("mars-wg@ietf.org", outbox[1]["To"])
+        self.assertIn("WG Last Call", outbox[1]["Subject"])
+        body = get_payload_text(outbox[1])
+        self.assertIn("disclosure obligations", body)
+        self.assertIn("starts a 10-week", body)
+        draft = WgDraftFactory(group=role.group)
+        url = urlreverse(
+            "ietf.doc.views_draft.change_stream_state",
+            kwargs=dict(name=draft.name, state_type="draft-stream-ietf"),
+        )
+        old_state = draft.get_state("draft-stream-%s" % draft.stream_id)
+        new_state = State.objects.get(
+            used=True, type="draft-stream-%s" % draft.stream_id, slug="wg-lc"
+        )
+        self.assertNotEqual(old_state, new_state)
+        empty_outbox()
+        r = self.client.post(
+            url,
+            dict(
+                new_state=new_state.pk,
+                comment="some comment",
+                tags=[
+                    t.pk
+                    for t in draft.tags.filter(
+                        slug__in=get_tags_for_stream_id(draft.stream_id)
+                    )
+                ],
+            ),
+        )
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(len(outbox), 2)
+        self.assertIn("mars-wg@ietf.org", outbox[1]["To"])
+        self.assertIn("WG Last Call", outbox[1]["Subject"])
+        body = get_payload_text(outbox[1])
+        self.assertIn("disclosure obligations", body)
+        self.assertIn("starts a 2-week", body)
+
     def test_pubreq_validation(self):
         role = RoleFactory(name_id='chair',group__acronym='mars',group__list_email='mars-wg@ietf.org',person__user__username='marschairman',person__name='WG Cháir Man')
         RoleFactory(name_id='delegate',group=role.group,person__user__email='marsdelegate@ietf.org')
@@ -2183,3 +2392,77 @@ class EditorialDraftMetadataTests(TestCase):
         top_level_metadata_headings = q("tbody>tr>th:first-child").text()
         self.assertNotIn("IESG", top_level_metadata_headings)
         self.assertNotIn("IANA", top_level_metadata_headings)
+
+class BallotEmailAjaxTests(TestCase):
+    def test_ajax_build_position_email(self):
+        def _post_json(self, url, json_to_post):
+            r = self.client.post(
+                url, json.dumps(json_to_post), content_type="application/json"
+            )
+            self.assertEqual(r.status_code, 200)
+            return json.loads(r.content)
+
+        doc = WgDraftFactory()
+        ad = RoleFactory(
+            name_id="ad", group=doc.group, person__name="Some Areadirector"
+        ).person
+        url = urlreverse("ietf.doc.views_ballot.ajax_build_position_email")
+        login_testing_unauthorized(self, "secretary", url)
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 405)
+        response = _post_json(self, url, {})
+        self.assertFalse(response["success"])
+        self.assertEqual(response["errors"], ["post_data not provided"])
+        response = _post_json(self, url, {"dictis": "not empty"})
+        self.assertFalse(response["success"])
+        self.assertEqual(response["errors"], ["post_data not provided"])
+        response = _post_json(self, url, {"post_data": {}})
+        self.assertFalse(response["success"])
+        self.assertEqual(len(response["errors"]), 7)
+        response = _post_json(
+            self,
+            url,
+            {
+                "post_data": {
+                    "discuss": "aaaaaa",
+                    "comment": "bbbbbb",
+                    "position": "discuss",
+                    "balloter": Person.objects.aggregate(maxpk=Max("pk") + 1)["maxpk"],
+                    "docname": "this-draft-does-not-exist",
+                    "cc_choices": ["doc_group_mail_list"],
+                    "additional_cc": "foo@example.com",
+                }
+            },
+        )
+        self.assertFalse(response["success"])
+        self.assertEqual(
+            response["errors"],
+            ["No person found matching balloter", "No document found matching docname"],
+        )
+        response = _post_json(
+            self,
+            url,
+            {
+                "post_data": {
+                    "discuss": "aaaaaa",
+                    "comment": "bbbbbb",
+                    "position": "discuss",
+                    "balloter": ad.pk,
+                    "docname": doc.name,
+                    "cc_choices": ["doc_group_mail_list"],
+                    "additional_cc": "foo@example.com",
+                }
+            },
+        )
+        self.assertTrue(response["success"])
+        for snippet in [
+            "aaaaaa",
+            "bbbbbb",
+            "DISCUSS",
+            ad.plain_name(),
+            doc.name,
+            doc.group.list_email,
+            "foo@example.com",
+        ]:
+            self.assertIn(snippet, response["text"])
+
