@@ -1,5 +1,4 @@
 #!/bin/bash
-set -x
 
 # load the older production dump (a compressed binary form)
 # dump a plaintext “before.sql”
@@ -25,7 +24,7 @@ echo
 pg_dump -c -h db -U django -d datatracker -f after.sql
 echo "Building recovery.sql..."
 cat after.sql | grep -v "^COPY " > after_nocopy.sql
-diff before.sql after_nocopy.sql > diff_recovery.txt || true
+diff before.sql after_nocopy.sql > diff_recovery.txt
 python extract_recovery.py diff_recovery.txt recovery.sql
 echo "Applying recovery.sql..."
 psql -h db -U django -d datatracker -f recovery.sql
@@ -33,5 +32,5 @@ echo "Dumping plaintext 'recovered.sql'..."
 pg_dump -c -h db -U django -d datatracker -f recovered.sql
 echo "Building recovery report..."
 cat recovered.sql | grep -v "^COPY " > recovered_nocopy.sql
-diff before.sql recovered_nocopy.sql > diff_recovered.txt || true
+diff before.sql recovered_nocopy.sql > diff_recovered.txt
 # python recovery_report.py diff_recovered.txt
