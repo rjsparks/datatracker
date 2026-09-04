@@ -272,6 +272,13 @@ class SessionDataApiTests(TestCase):
             headers={"X-Api-Key": token},
         )
 
+    def unscheduled_session(self, meeting=None):
+        return SessionFactory(
+            group__type_id="wg",
+            meeting=meeting or self.meeting,
+            add_to_schedule=False,
+        )
+
     def materials(self, type_id, doc):
         path = Path(self.meeting.get_materials_path()) / type_id / doc.uploaded_filename
         return get_unicode_document_content(doc.name, path)
@@ -363,6 +370,24 @@ class SessionDataApiTests(TestCase):
             "events are attributed to the (System) person",
         )
 
+    def test_rejects_video_url_the_column_cannot_hold(self):
+        """An over-long URL is refused before any document or event is written"""
+        r = self.post("video_url", {"url": "https://example.com/" + "a" * 250})
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(self.session.recordings())
+
+    def test_rejects_video_url_update_the_column_cannot_hold(self):
+        """The update path refuses it too, leaving the recording and its history alone"""
+        self.post("video_url", {"url": "https://example.com/first"})
+        doc = self.session.recordings()[0]
+        events_before = doc.docevent_set.count()
+
+        r = self.post("video_url", {"url": "https://example.com/" + "a" * 250})
+        self.assertEqual(r.status_code, 400)
+        doc.refresh_from_db()
+        self.assertEqual(doc.external_url, "https://example.com/first")
+        self.assertEqual(doc.docevent_set.count(), events_before)
+
     def test_updates_existing_video_recording(self):
         self.post("video_url", {"url": "https://example.com/first"})
         self.post("video_url", {"url": "https://example.com/second"})
@@ -397,6 +422,15 @@ class SessionDataApiTests(TestCase):
         self.assertIn("Some Organization", content)
         self.assertIn("Another Body", content)
         self.assertEqual(doc.docevent_set.first().by, self.system)
+
+    def test_bluesheet_without_official_timeslot_is_400(self):
+        r = self.post(
+            "bluesheet",
+            {"bluesheet": [{"name": "Some Body"}]},
+            session=self.unscheduled_session(),
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(Document.objects.filter(type_id="bluesheets").exists())
 
     def test_bluesheet_upload_bumps_revision(self):
         self.post("bluesheet", {"bluesheet": [{"name": "Some Body"}]})
@@ -510,6 +544,59 @@ class SessionDataApiTests(TestCase):
         self.assertEqual([e["attr"] for e in errors], ["person_uuid"])
         self.assertEqual([e["detail"] for e in errors], [unknown])
         self.assertFalse(self.session.attended_set.exists())
+
+    def test_rejects_join_time_without_an_offset(self):
+        """A naive join_time is refused rather than read in the server's timezone"""
+        person = PersonFactory()
+        r = self.post(
+            "attendees",
+            {
+                "attendees": [
+                    {
+                        "person_uuid": str(person.primary_uuid),
+                        "join_time": "2024-02-21T18:00:00",
+                    }
+                ]
+            },
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(
+            [e["attr"] for e in r.json()["errors"]], ["attendees.0.join_time"]
+        )
+        self.assertFalse(self.session.attended_set.exists())
+
+    def test_reports_each_unknown_uuid_once(self):
+        unknown = "6f9a1c30-6c7e-4f0a-9a3f-2f1d0b8a4e11"
+        r = self.post(
+            "attendees",
+            {
+                "attendees": [
+                    {"person_uuid": unknown, "join_time": "2024-02-21T18:00:00Z"},
+                    {"person_uuid": unknown, "join_time": "2024-02-21T18:00:01Z"},
+                ]
+            },
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual([e["detail"] for e in r.json()["errors"]], [unknown])
+
+    def test_failed_bluesheet_leaves_no_attendees(self):
+        """The Attended rows and the interim bluesheet succeed or fail together"""
+        session = self.unscheduled_session(MeetingFactory(type_id="interim"))
+        person = PersonFactory()
+        r = self.post(
+            "attendees",
+            {
+                "attendees": [
+                    {
+                        "person_uuid": str(person.primary_uuid),
+                        "join_time": "2024-02-21T18:00:00Z",
+                    }
+                ]
+            },
+            session=session,
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertFalse(session.attended_set.exists())
 
     def test_repeated_attendee_push_keeps_first_join_time(self):
         person = PersonFactory()

@@ -1,5 +1,6 @@
 # Copyright The IETF Trust 2026, All Rights Reserved
 
+from django.utils import timezone
 from rest_framework import serializers
 
 from ietf.meeting.models import Registration
@@ -28,10 +29,28 @@ class PersonAttendedMeetingsSerializer(serializers.Serializer):
     attended = AttendedMeetingSerializer(source="attended_registrations", many=True)
 
 
+class AwareDateTimeField(serializers.DateTimeField):
+    """DateTimeField that requires an explicit UTC offset
+
+    DateTimeField makes a naive value aware in the process timezone, which silently
+    shifts a timestamp the caller meant as UTC.
+    """
+
+    default_error_messages = {  # noqa: RUF012
+        "naive": "Datetime must include a UTC offset.",
+    }
+
+    def enforce_timezone(self, value):
+        if timezone.is_naive(value):
+            self.fail("naive")
+        return super().enforce_timezone(value)
+
+
 class SessionVideoUrlSerializer(serializers.Serializer):
     """A session's video recording URL"""
 
-    url = serializers.URLField()
+    # max_length matches Document.external_url
+    url = serializers.URLField(max_length=200)
 
 
 class SessionRecordingNameSerializer(serializers.Serializer):
@@ -60,7 +79,7 @@ class SessionAttendeeSerializer(serializers.Serializer):
     """One session attendee, identified by any UUID the datatracker issued them"""
 
     person_uuid = serializers.UUIDField()
-    join_time = serializers.DateTimeField()
+    join_time = AwareDateTimeField()
 
 
 class SessionAttendeesSerializer(serializers.Serializer):

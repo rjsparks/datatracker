@@ -2,6 +2,7 @@
 from django.core.files.base import ContentFile
 from django.db.models import IntegerField
 from django.db.models.functions import Cast
+from django.db import transaction
 from django.http import Http404
 from django.template.loader import render_to_string
 from drf_spectacular.utils import extend_schema, extend_schema_view
@@ -252,9 +253,11 @@ class SessionAttendeesView(SessionDataView):
             ).select_related("person")
         }
         unresolved = sorted(
-            str(a["person_uuid"])
-            for a in attendees
-            if a["person_uuid"] not in person_by_uuid
+            {
+                str(a["person_uuid"])
+                for a in attendees
+                if a["person_uuid"] not in person_by_uuid
+            }
         )
         if unresolved:
             # All-or-nothing: a partial success leaves the caller unable to tell which
@@ -262,23 +265,26 @@ class SessionAttendeesView(SessionDataView):
             # ietf.person.api_uuid batch endpoints do.
             raise serializers.ValidationError({"person_uuid": unresolved})
 
-        # ignore_conflicts because attendees are pushed repeatedly as a session runs
-        Attended.objects.bulk_create(
-            [
-                Attended(
-                    session=session,
-                    person=person_by_uuid[a["person_uuid"]],
-                    time=a["join_time"],
-                )
-                for a in attendees
-            ],
-            ignore_conflicts=True,
-        )
+        # One transaction so a bluesheet failure does not leave the Attended rows
+        # behind. Anything the bluesheet step wrote to disk is not rolled back.
+        with transaction.atomic():
+            # ignore_conflicts because attendees are pushed repeatedly as a session runs
+            Attended.objects.bulk_create(
+                [
+                    Attended(
+                        session=session,
+                        person=person_by_uuid[a["person_uuid"]],
+                        time=a["join_time"],
+                    )
+                    for a in attendees
+                ],
+                ignore_conflicts=True,
+            )
 
-        save_error = None
-        if session.meeting.type_id == "interim":
-            save_error = generate_bluesheet(session, system_person())
-        return self.applied(session, save_error)
+            save_error = None
+            if session.meeting.type_id == "interim":
+                save_error = generate_bluesheet(session, system_person())
+            return self.applied(session, save_error)
 
 
 class SessionChatlogView(SessionDataView):
