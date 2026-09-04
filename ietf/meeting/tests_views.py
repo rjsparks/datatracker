@@ -6568,7 +6568,7 @@ class FinalizeProceedingsTests(TestCase):
         self.assertEqual(r.status_code, 302)
         self.assertTrue(mock.called)
         self.assertCountEqual(
-            [call_args[0][1] for call_args in mock.call_args_list],
+            [call_args[0][0] for call_args in mock.call_args_list],
             [sess for sess in meeting.session_set.all()],
         )
 
