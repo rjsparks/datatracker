@@ -56,6 +56,17 @@ class SessionBluesheetSerializer(serializers.Serializer):
     bluesheet = BluesheetEntrySerializer(many=True, allow_empty=True)
 
 
+class SessionAttendeeSerializer(serializers.Serializer):
+    """One session attendee, identified by any UUID the datatracker issued them"""
+
+    person_uuid = serializers.UUIDField()
+    join_time = serializers.DateTimeField()
+
+
+class SessionAttendeesSerializer(serializers.Serializer):
+    attendees = SessionAttendeeSerializer(many=True, allow_empty=True)
+
+
 class SessionChatlogSerializer(serializers.Serializer):
     """A session's chat log
 
